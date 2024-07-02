@@ -1,22 +1,30 @@
 import openff.toolkit
 import openmm.app
 import os
+import numpy as np
 
 def main():
-    pdb = openmm.app.PDBFile('./phenol.pdb')
-    modeller = openmm.app.Modeller(lig_pdb.topology, lig_pdb.positions)
-
+    # OpenFF to OpenMM - Ligand
     mol = openff.toolkit.Molecule.from_smiles("c1ccccc1O")
     mol.generate_conformers(n_conformers=1)
+    topology = mol.to_topology().to_openmm()
+    positions = mol.conformers[0].to_openmm()
+    positions = positions + np.array([2,2,2])*openmm.unit.nanometer # translate to avoid clash with protein
+    topology.setUnitCellDimensions([4,4,4])
 
-    # mol = openff.toolkit.Molecule.from_file("phenol.sdf", "SDF")
+    # Load protein
+    prot = openmm.app.PDBFile('1uao.pdb')
+    
+    # Merge prot and lig
+    modeller = openmm.app.Modeller(topology, positions)
+    modeller.add(prot.topology, prot.positions)
 
-    # ff = openff.toolkit.ForceField("openff-2.0.0.offxml")
-    # ff = openff.toolkit.ForceField("phenol_openff.xml")
     ff = openmm.app.ForceField('amber14-all.xml', 'amber14/tip3pfb.xml','phenol_openff.xml')
+    modeller.addSolvent(ff)
+    openmm.app.PDBFile.writeFile(modeller.topology, modeller.positions, open('phenol_prot.pdb','w'))
 
     #sys = ff.create_openmm_system(mol.to_topology())
-    sys = ff.createSystem(mol.to_topology().to_openmm())
+    sys = ff.createSystem(modeller.topology)
     sys.addForce(openmm.CMMotionRemover())  # remove COM motion to avoid drift
 
     integrator = openmm.LangevinIntegrator(
@@ -24,15 +32,15 @@ def main():
     )
 
     sim = openmm.app.Simulation(
-        mol.to_topology().to_openmm(),
+        modeller.topology,
         sys,
         integrator,
         openmm.Platform.getPlatformByName("Reference"),  # faster if running in vacuum
     )
-    sim.reporters.append(openmm.app.PDBReporter("phenol-traj.pdb", reportInterval=100))
-    sim.context.setPositions(mol.conformers[0].to_openmm())
+    sim.reporters.append(openmm.app.DCDReporter("phenol_prot-traj.dcd", reportInterval=100))
+    sim.context.setPositions(modeller.positions)
 
-    sim.step(10000)
+    sim.step(1000)
 
 
 if __name__ == '__main__':
