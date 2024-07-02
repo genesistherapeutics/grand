@@ -1,4 +1,7 @@
 <ForceField>
+  <Info>
+    <DateGenerated>2024-06-26</DateGenerated>
+  </Info>
   <AtomTypes>
     <Type name="[H]c1c(c(c(c(c1[H])[H])O[H])[H])[H]$C1#0" element="C" mass="12.01078" class="[H]c1c(c(c(c(c1[H])[H])O[H])[H])[H]$C1#0"/>
     <Type name="[H]c1c(c(c(c(c1[H])[H])O[H])[H])[H]$C2#1" element="C" mass="12.01078" class="[H]c1c(c(c(c(c1[H])[H])O[H])[H])[H]$C2#1"/>

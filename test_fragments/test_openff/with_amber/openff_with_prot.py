@@ -1,17 +1,22 @@
 import openff.toolkit
 import openmm.app
-
+import os
 
 def main():
+    pdb = openmm.app.PDBFile('./phenol.pdb')
+    modeller = openmm.app.Modeller(lig_pdb.topology, lig_pdb.positions)
+
     mol = openff.toolkit.Molecule.from_smiles("c1ccccc1O")
     mol.generate_conformers(n_conformers=1)
 
     # mol = openff.toolkit.Molecule.from_file("phenol.sdf", "SDF")
 
     # ff = openff.toolkit.ForceField("openff-2.0.0.offxml")
-    ff = openff.toolkit.ForceField("phenol_openff.xml")
+    # ff = openff.toolkit.ForceField("phenol_openff.xml")
+    ff = openmm.app.ForceField('amber14-all.xml', 'amber14/tip3pfb.xml','phenol_openff.xml')
 
-    sys = ff.create_openmm_system(mol.to_topology())
+    #sys = ff.create_openmm_system(mol.to_topology())
+    sys = ff.createSystem(mol.to_topology().to_openmm())
     sys.addForce(openmm.CMMotionRemover())  # remove COM motion to avoid drift
 
     integrator = openmm.LangevinIntegrator(
