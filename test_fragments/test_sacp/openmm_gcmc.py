@@ -114,18 +114,14 @@ def main():
         nonbonded_force.updateParametersInContext(sim.context)
         ghost_frag_res_ids.remove(res_id)
         
-        rot_start = time.time()
         # Randomly rotate selected residue
         insert_point = (np.random.rand(3) * 4) * openmm.unit.nanometers
         new_positions = lu.rotate_molecule(sys_pos,frag_atom_ids[res_id],insert_point)
         sim.context.setPositions(new_positions)
-        print(time.time()-rot_start)
         #sim.step(1)
-        mc_start = time.time()
         #new_state = sim.context.getState(getPositions=True,getEnergy=True)
         #new_positions = sim.context.getState(getPositions=True).getPositions()
         new_energy = sim.context.getState(getEnergy=True).getPotentialEnergy()
-        print(time.time()-mc_start)
         #pdb_reporter.report(sim,sim.context.getState(getPositions=True,getEnergy=True))
         dcd_reporter.report(sim,sim.context.getState(getPositions=True,getEnergy=True))
         # Decide
@@ -147,7 +143,6 @@ def main():
             # Update energy
             energy = new_energy
         #openmm.app.PDBFile.writeFile(sim.topology,positions,open(f'output/GCMC_test_{step}.pdb','w'))
-        print(time.time()-mc_start)
         f.write(",".join(real_frag_res_ids)+"\n")
     print(n_accepted)
     
@@ -161,16 +156,13 @@ def main():
         real_frag_res_ids.remove(res_id)
 
         #sim.step(1)
-        mc_start = time.time()
         #new_state = sim.context.getState(getPositions=True,getEnergy=True)
         #new_positions = sim.context.getState(getPositions=True).getPositions()
         new_energy = sim.context.getState(getEnergy=True).getPotentialEnergy()
-        print(time.time()-mc_start)
         #pdb_reporter.report(sim,sim.context.getState(getPositions=True,getEnergy=True))
         dcd_reporter.report(sim,sim.context.getState(getPositions=True,getEnergy=True))
         # Decide
         acc_prob = N * math.exp(-B) * math.exp(-(new_energy - energy) / kT)
-        print('prob:',acc_prob, n_accepted)
         if acc_prob < np.random.rand() or np.isnan(acc_prob):
             # Need to revert the changes made if the move is to be rejected
             # Switch off nonbonded interactions involving this water
@@ -189,7 +181,6 @@ def main():
             # Update energy
             energy = new_energy
         #openmm.app.PDBFile.writeFile(sim.topology,positions,open(f'output/GCMC_test_{step}.pdb','w'))
-        print(time.time()-mc_start)
         f.write(",".join(real_frag_res_ids)+"\n")
     print(n_accepted)    
 

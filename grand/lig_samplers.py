@@ -8,6 +8,7 @@ Kibum Park kibum@genesistherapeutics.ai
 """
 
 import numpy as np
+from collections import defaultdict
 import mdtraj
 import os
 import logging
@@ -18,6 +19,7 @@ from simtk import unit
 from simtk import openmm
 from openmmtools.integrators import NonequilibriumLangevinIntegrator
 
+from grand.utils import random_rotation_matrix
 import grand.lig_utils as lu
 
 class BaseGCMCSampler(object):
@@ -65,6 +67,9 @@ class BaseGCMCSampler(object):
         self.n_moves = 0
         self.n_accepted = 0
         self.acceptance_probabilities = []  # Store acceptance probabilities
+        self.ghost_lig_res_ids = []
+        self.real_lig_res_ids = []
+        self.lig_atom_ids = defaultdict(list)
 
         # Get parameters for the ligand model
         self.lig_params = self.get_ligand_parameters(self.nonbonded_force)
@@ -85,6 +90,70 @@ class BaseGCMCSampler(object):
             self.nonbonded_force.setParticleParameters(atom_id, charge, sigma, eps)
         self.nonbonded_force.updateParametersInContext(self.context)
 
-    def insert(atoms, insert_point, random_rotate=True):
-        if random_rotate:
-            
+    def insert(self, atoms, insert_point=None, random_rotate=True):
+        R = random_rotation_matrix()
+        new_positions = deepcopy(self.positions)
+        for i, index in enumerate(atoms):
+            #  Translate coordinates to an origin defined by the oxygen atom, and normalise
+            atom_position = self.positions[index] - self.positions[atoms[0]]
+            # Rotate about the oxygen position
+            if i != 0:
+                vec_length = np.linalg.norm(atom_position)
+                atom_position = atom_position / vec_length
+                if random_rotate:
+                    # Rotate coordinates & restore length
+                    atom_position = vec_length * np.dot(R, atom_position) #* unit.nanometer
+            if insert_point is not None:
+                # Translate to insertion point
+                new_positions[index] = atom_position + insert_point
+            else:
+                new_positions[index] = atom_position
+        self.adjust_specific_ligand(atoms,self.params,mode='on')
+        return new_positions
+    
+    def delete(self, atoms):
+        self.adjust_specific_ligand(atoms,self.params,mode='off')
+
+    def move(self):
+        if np.random.randint(2) == 1:
+            # Insert
+            res_id = np.random.choice(self.ghost_lig_res_ids)
+            atoms = self.lig_atom_ids[res_id]
+            insert_point = (np.random.rand(3) * self.simulation_box) * openmm.unit.nanometers
+            new_positions = self.insert(atoms, insert_point)
+            self.context.setPositions(new_positions)
+            new_energy = self.context.getState(getEnergy=True).getPotentialEnergy()
+            acc_prob = math.exp(self.B) * math.exp(-(new_energy - self.energy) / self.kT) / (self.N + 1)
+            if acc_prob < np.random.rand() or np.isnan(acc_prob):
+                self.adjust_specific_ligand(atoms,self.params,mode='off')
+                self.context.setPositions(self.positions)
+            else:
+                # Update some variables if move is accepted
+                self.positions = deepcopy(new_positions)
+                self.N += 1
+                self.n_accepted += 1
+                self.real_lig_res_ids.append(str(res_id))
+                self.ghost_lig_res_ids.remove(res_id)
+                # Update energy
+                self.energy = new_energy
+        else:
+            # Delete
+            res_id = np.random.choice(self.real_lig_res_ids)
+            atoms = self.lig_atom_ids[res_id]
+            self.delete(atoms)
+            new_energy = self.context.getState(getEnergy=True).getPotentialEnergy()
+            acc_prob = self.N * math.exp(-self.B) * math.exp(-(new_energy - self.energy) / self.kT)
+            if acc_prob < np.random.rand() or np.isnan(acc_prob):
+                self.adjust_specific_ligand(atoms,self.params,mode='on')
+                self.context.setPositions(self.positions)
+            else:
+                # Update some variables if move is accepted
+                self.positions = deepcopy(new_positions)
+                self.N += 1
+                self.n_accepted += 1
+                self.ghost_lig_res_ids.append(str(res_id))
+                self.real_lig_res_ids.remove(res_id)
+                # Update energy
+                self.energy = new_energy
+
+
