@@ -8,6 +8,8 @@ from copy import deepcopy
 import lig_utils as lu
 import math
 import tqdm
+
+import time
 #import lig_samplers as ls
 
 # TODO
@@ -15,10 +17,13 @@ import tqdm
 # deletion steps
 
 # ISSUES
-# 1. ligand conformation is fixed
-# 2. Protein conformaiton is also fixed
+# - Performance
+# Somehow setPositions/simulation.context.getState seems to be the bottleneck
+# - ligand conformation is fixed
+# - Protein conformaiton is also fixed
 # Added MD steps in between GCMC - it now takes 40 seconds per step (without it 6s/step)
-
+# Add 1nm padding around protein and have 4nm*4nm*4nm simulation box
+# Put phenols at the single point where it does not interact with the protein 
 
 def main():
     # OpenFF to OpenMM - Ligand
@@ -32,6 +37,9 @@ def main():
     prot = openmm.app.PDBFile('1uao.pdb')
     prot.topology.setUnitCellDimensions([4,4,4])
     
+    # Define ligand position
+    
+
     # Merge prot and lig
     if os.path.exists('gcmc-ghosts.pdb'):
         pdb = openmm.app.PDBFile('gcmc-ghosts.pdb')
@@ -53,11 +61,11 @@ def main():
         sys_top,
         sys,
         integrator,
-        openmm.Platform.getPlatformByName("Reference"),  # faster if running in vacuum
+        openmm.Platform.getPlatformByName("CUDA"),  # faster if running in vacuum
     )
-    #sim.reporters.append(openmm.app.DCDReporter("phenol_sacp.dcd", reportInterval=100))
-    #sim.reporters.append(openmm.app.PDBReporter("proposal_tracking.pdb",reportInterval=100))
-    pdb_reporter = openmm.app.PDBReporter("proposal_tracking.pdb",reportInterval=100)
+    sim.reporters.append(openmm.app.DCDReporter("phenol_sacp.dcd", reportInterval=100))
+    dcd_reporter = openmm.app.DCDReporter("phenol_sacp.dcd", reportInterval=100)
+    #sim.reporters.append(openmm.app.PDBReporter("proposal_tracking.pdb",reportInterval=100)
     sim.context.setPositions(sys_pos)
 
     for f in range(sys.getNumForces()):
@@ -106,15 +114,20 @@ def main():
         nonbonded_force.updateParametersInContext(sim.context)
         ghost_frag_res_ids.remove(res_id)
         
+        rot_start = time.time()
         # Randomly rotate selected residue
         insert_point = (np.random.rand(3) * 4) * openmm.unit.nanometers
         new_positions = lu.rotate_molecule(sys_pos,frag_atom_ids[res_id],insert_point)
         sim.context.setPositions(new_positions)
-        sim.step(10)
-        new_state = sim.context.getState(getPositions=True,getEnergy=True)
-        new_positions = new_state.getPositions()
-        new_energy = new_state.getPotentialEnergy()
-        pdb_reporter.report(sim,sim.context.getState(getPositions=True,getEnergy=True))
+        print(time.time()-rot_start)
+        #sim.step(1)
+        mc_start = time.time()
+        #new_state = sim.context.getState(getPositions=True,getEnergy=True)
+        #new_positions = sim.context.getState(getPositions=True).getPositions()
+        new_energy = sim.context.getState(getEnergy=True).getPotentialEnergy()
+        print(time.time()-mc_start)
+        #pdb_reporter.report(sim,sim.context.getState(getPositions=True,getEnergy=True))
+        dcd_reporter.report(sim,sim.context.getState(getPositions=True,getEnergy=True))
         # Decide
         acc_prob = math.exp(B) * math.exp(-(new_energy - energy) / kT) / (N + 1)
         if acc_prob < np.random.rand() or np.isnan(acc_prob):
@@ -134,9 +147,52 @@ def main():
             # Update energy
             energy = new_energy
         #openmm.app.PDBFile.writeFile(sim.topology,positions,open(f'output/GCMC_test_{step}.pdb','w'))
+        print(time.time()-mc_start)
         f.write(",".join(real_frag_res_ids)+"\n")
     print(n_accepted)
     
+    # Deletion
+    n_accepted=0
+    for step in tqdm.tqdm(range(n_step)):
+        res_id = np.random.choice(real_frag_res_ids)
+        for atom_id in frag_atom_ids[res_id]:
+            nonbonded_force.setParticleParameters(atom_id, 0., 0., 0.)
+        nonbonded_force.updateParametersInContext(sim.context)
+        real_frag_res_ids.remove(res_id)
+
+        #sim.step(1)
+        mc_start = time.time()
+        #new_state = sim.context.getState(getPositions=True,getEnergy=True)
+        #new_positions = sim.context.getState(getPositions=True).getPositions()
+        new_energy = sim.context.getState(getEnergy=True).getPotentialEnergy()
+        print(time.time()-mc_start)
+        #pdb_reporter.report(sim,sim.context.getState(getPositions=True,getEnergy=True))
+        dcd_reporter.report(sim,sim.context.getState(getPositions=True,getEnergy=True))
+        # Decide
+        acc_prob = N * math.exp(-B) * math.exp(-(new_energy - energy) / kT)
+        print('prob:',acc_prob, n_accepted)
+        if acc_prob < np.random.rand() or np.isnan(acc_prob):
+            # Need to revert the changes made if the move is to be rejected
+            # Switch off nonbonded interactions involving this water
+            for atom_id in frag_atom_ids[res_id]:
+                charge, sigma, eps = atom_param_dict[atom_id]
+                nonbonded_force.setParticleParameters(atom_id, charge, sigma, eps)
+            nonbonded_force.updateParametersInContext(sim.context)
+            sim.context.setPositions(positions)
+            real_frag_res_ids.append(res_id)
+        else:
+            # Update some variables if move is accepted
+            positions = deepcopy(new_positions)
+            N += 1
+            n_accepted += 1
+            ghost_frag_res_ids.append(str(res_id))
+            # Update energy
+            energy = new_energy
+        #openmm.app.PDBFile.writeFile(sim.topology,positions,open(f'output/GCMC_test_{step}.pdb','w'))
+        print(time.time()-mc_start)
+        f.write(",".join(real_frag_res_ids)+"\n")
+    print(n_accepted)    
+
 
     #sim.step(1000)
 
