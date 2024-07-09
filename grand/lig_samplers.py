@@ -15,8 +15,8 @@ import logging
 import parmed
 import math
 from copy import deepcopy
-from simtk import unit
-from simtk import openmm
+import openmm.unit as unit
+import openmm
 from openmmtools.integrators import NonequilibriumLangevinIntegrator
 
 from grand.utils import random_rotation_matrix
@@ -27,7 +27,7 @@ class BaseGCMCSampler(object):
     Base class for carrying out GCMC moves in OpenMM.
     All other Sampler objects are derived from this
     """
-    def __init__(self, system, topology, temperature, ghost, log='gcmc.log', overwrite=False):
+    def __init__(self, system, topology, temperature, ligands, log='gcmc.log', overwrite=False):
         # Create logging object
         if os.path.isfile(log):
             if overwrite:
@@ -67,14 +67,38 @@ class BaseGCMCSampler(object):
         self.n_moves = 0
         self.n_accepted = 0
         self.acceptance_probabilities = []  # Store acceptance probabilities
+        self.lig_res_ids = ligands
         self.ghost_lig_res_ids = []
         self.real_lig_res_ids = []
         self.lig_atom_ids = defaultdict(list)
-
-        # Get parameters for the ligand model
-        self.lig_params = self.get_ligand_parameters(self.nonbonded_force)
-
-
+        for resid, residue in enumerate(topology.residues()):
+            if resid in self.lig_res_ids:
+                for atom in residue.atoms():
+                    self.lig_atom_ids[resid].append(atom.index)
+        self.lig_params = defaultdict(list)
+        for lig_res_id in self.lig_atom_ids.keys():
+            for atom_id in self.lig_atom_ids[lig_res_id]:
+                charge, simga, eps = self.nonbonded_force.getParticleParameters(atom_id)
+                self.lig_params[atom_id] = [charge, simga, eps]
+                self.nonbonded_force.setParticleParameters(atom_id, 0., 0., 0.,)
+    
+    def initialize(self,B, positions,integrator,ghosts=None):
+        self.B = B
+        self.positions = positions
+        self.simulation = openmm.app.Simulation(
+            self.topology,
+            self.system,    
+            integrator,
+            openmm.Platform.getPlatformByName("CUDA"),  # faster if running in vacuum
+        )
+        self.context = self.simulation.context
+        self.context.setPositions(self.positions)
+        self.energy = self.context.getState(getEnergy=True).getPotentialEnergy()
+        if ghosts:
+            self.ghost_lig_res_ids = ghosts
+        else:
+            self.ghost_lig_res_ids = self.lig_res_ids
+    
     def adjust_specific_ligand(self, atoms, params, mode):
         for atom_id in atoms:
             if mode == 'on':
@@ -102,30 +126,30 @@ class BaseGCMCSampler(object):
                 atom_position = atom_position / vec_length
                 if random_rotate:
                     # Rotate coordinates & restore length
-                    atom_position = vec_length * np.dot(R, atom_position) #* unit.nanometer
+                    atom_position = vec_length * np.dot(R, atom_position)
             if insert_point is not None:
                 # Translate to insertion point
                 new_positions[index] = atom_position + insert_point
             else:
                 new_positions[index] = atom_position
-        self.adjust_specific_ligand(atoms,self.params,mode='on')
+        self.adjust_specific_ligand(atoms,self.lig_params,mode='on')
         return new_positions
     
     def delete(self, atoms):
-        self.adjust_specific_ligand(atoms,self.params,mode='off')
+        self.adjust_specific_ligand(atoms,self.lig_params,mode='off')
 
     def move(self):
         if np.random.randint(2) == 1:
             # Insert
             res_id = np.random.choice(self.ghost_lig_res_ids)
             atoms = self.lig_atom_ids[res_id]
-            insert_point = (np.random.rand(3) * self.simulation_box) * openmm.unit.nanometers
+            insert_point = (np.random.rand(3) * self.simulation_box)
             new_positions = self.insert(atoms, insert_point)
             self.context.setPositions(new_positions)
             new_energy = self.context.getState(getEnergy=True).getPotentialEnergy()
             acc_prob = math.exp(self.B) * math.exp(-(new_energy - self.energy) / self.kT) / (self.N + 1)
             if acc_prob < np.random.rand() or np.isnan(acc_prob):
-                self.adjust_specific_ligand(atoms,self.params,mode='off')
+                self.adjust_specific_ligand(atoms,self.lig_params,mode='off')
                 self.context.setPositions(self.positions)
             else:
                 # Update some variables if move is accepted
@@ -136,7 +160,7 @@ class BaseGCMCSampler(object):
                 self.ghost_lig_res_ids.remove(res_id)
                 # Update energy
                 self.energy = new_energy
-        else:
+        elif len(self.real_lig_res_ids) != 0:
             # Delete
             res_id = np.random.choice(self.real_lig_res_ids)
             atoms = self.lig_atom_ids[res_id]
@@ -144,7 +168,7 @@ class BaseGCMCSampler(object):
             new_energy = self.context.getState(getEnergy=True).getPotentialEnergy()
             acc_prob = self.N * math.exp(-self.B) * math.exp(-(new_energy - self.energy) / self.kT)
             if acc_prob < np.random.rand() or np.isnan(acc_prob):
-                self.adjust_specific_ligand(atoms,self.params,mode='on')
+                self.adjust_specific_ligand(atoms,self.lig_params,mode='on')
                 self.context.setPositions(self.positions)
             else:
                 # Update some variables if move is accepted

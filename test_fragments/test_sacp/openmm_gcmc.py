@@ -143,7 +143,7 @@ def main():
             # Update energy
             energy = new_energy
         #openmm.app.PDBFile.writeFile(sim.topology,positions,open(f'output/GCMC_test_{step}.pdb','w'))
-        f.write(",".join(real_frag_res_ids)+"\n")
+        f.write(",".join(ghost_frag_res_ids)+"\n")
     print(n_accepted)
     
     # Deletion
