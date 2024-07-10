@@ -62,7 +62,7 @@ def add_ghosts(prot_top, prot_pos, lig_top, lig_pos, n=10, output='gcmc-ghosts.p
 
     # Add multiple copies of the same water, then write out a pdb (for visualisation)
     ghosts = []        
-    new_centres = np.random.rand(n,3) * box_size
+    new_centres = box_size
     for idx in tqdm.tqdm(range(n)):
         # Need to translate the water to a random point in the simulation box]
         new_positions = deepcopy(lig_pos)
