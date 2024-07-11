@@ -18,6 +18,7 @@ from copy import deepcopy
 import openmm.unit as unit
 import openmm
 from openmmtools.integrators import NonequilibriumLangevinIntegrator
+from openmmtools.constants import ONE_4PI_EPS0
 
 from grand.utils import random_rotation_matrix
 import grand.lig_utils as lu
@@ -68,6 +69,8 @@ class BaseGCMCSampler(object):
         self.n_moves = 0
         self.n_accepted = 0
         self.acceptance_probabilities = []  # Store acceptance probabilities
+        
+        # Store ligand parameters
         self.lig_res_ids = ligands
         self.ghost_lig_res_ids = []
         self.real_lig_res_ids = []
@@ -82,6 +85,7 @@ class BaseGCMCSampler(object):
         #        charge, simga, eps = self.nonbonded_force.getParticleParameters(atom_id)
         #        self.lig_params[atom_id] = [charge, simga, eps]
         #        self.nonbonded_force.setParticleParameters(atom_id, 0., 0., 0.,)
+
     def initialize(self,B, positions,integrator,reporter=None, ghosts=None):
         self.B = B
         self.positions = positions
@@ -111,6 +115,7 @@ class BaseGCMCSampler(object):
                 self.nonbonded_force.setParticleParameters(atom_id, 0., 0., 0.,)
         self.nonbonded_force.updateParametersInContext(self.context)
         self.energy = self.context.getState(getEnergy=True).getPotentialEnergy()
+        print(f'Initial Energy: {self.energy}')
         if reporter:
             self.reporter = reporter
         if ghosts:
@@ -122,6 +127,97 @@ class BaseGCMCSampler(object):
         self.max_dimension = self.prot_positions.max() + np.array([1,1,1]) * unit.nanometer
 
         self.velocities = self.context.getState(getVelocities=True).getVelocities()
+
+    def customize_forces(self):
+        """
+        Create a CustomNonbondedForce to handle ligand-ligand interactions
+        For custom steric (LJ potential), soft core potential will be used
+        For custom coulomb force, cufoff periodic with reaction field will be used
+        These custom forces are applied to turn off ligand-ligand interactions
+        """
+        if self.nonbonded_force.getNonbondedMethod() != openmm.NonbondedForce.CutoffPeriodic:
+            self.raiseError("Currently only supporting CutoffPeriodic for long range electrostatics")
+        else:
+            eps_solvent = self.nonbonded_force.getReactionFieldDielectric()
+            cutoff = self.nonbonded_force.getCutoffDistance()
+            krf = (1/ (cutoff**3)) * (eps_solvent - 1) / (2*eps_solvent + 1)
+            crf = (1/ cutoff) * (3* eps_solvent) / (2*eps_solvent + 1)
+
+        energy_expression  = "select(condition, 0, 1)*all;"
+        energy_expression += "condition = soluteFlag2*soluteFlag2;" #solute must have flag int(1)
+        energy_expression += "all=(lambda^soft_a) * 4 * epsilon * x * (x-1.0) + ONE_4PI_EPS0*chargeprod*(1/r + krf*r*r - crf);"
+        energy_expression += "x = (sigma/reff)^6;"  # Define x as sigma/r(effective)
+        energy_expression += "reff = sigma*((soft_alpha*(1.0-lambda)^soft_b + (r/sigma)^soft_c))^(1/soft_c);" # Calculate effective distance
+        energy_expression += "lambda = lambda1*lambda2;"
+        energy_expression += "epsilon = epsilon1*epsilon2;"
+        energy_expression += "sigma = 0.5*(sigma1+sigma2);"
+        energy_expression += "ONE_4PI_EPS0 = {:f};".format(ONE_4PI_EPS0)  # already in OpenMM units
+        energy_expression += "chargeprod = charge1*charge2;"
+        energy_expression += "krf = {:f};".format(krf.value_in_unit(unit.nanometer**-3))
+        energy_expression += "crf = {:f};".format(crf.value_in_unit(unit.nanometer**-1))
+        custom_nonbonded_force = openmm.CustomNonbondedForce(energy_expression)
+        custom_nonbonded_force.addPerParticleParameter('soluteFlag')
+        custom_nonbonded_force.addPerParticleParameter('charge')
+        custom_nonbonded_force.addPerParticleParameter('sigma')
+        custom_nonbonded_force.addPerParticleParameter('epsilon')
+        custom_nonbonded_force.addPerParticleParameter('lambda')
+        # Configure force
+        custom_nonbonded_force.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
+        custom_nonbonded_force.setCutoffDistance(1*unit.amount_dimensionnanometer)
+        self.nonbonded_force.setUseDispersionCorrection(False)
+        custom_nonbonded_force.setUseLongRangeCorrection(self.nonbonded_force.getUseDispersionCorrection())
+        custom_nonbonded_force.setUseSwitchingFunction(self.nonbonded_force.getUseSwitchingFunction())
+        custom_nonbonded_force.setSwitchingDistance(self.nonbonded_force.getSwitchingDistance())
+        # Set softcore parameters
+        custom_nonbonded_force.addGlobalParameter('soft_alpha', 0.5)
+        custom_nonbonded_force.addGlobalParameter('soft_a', 1)
+        custom_nonbonded_force.addGlobalParameter('soft_b', 1)
+        custom_nonbonded_force.addGlobalParameter('soft_c', 6)
+
+        #TODO need to change
+        lig_atom_ids = []
+        for resid, residue in enumerate(self.topology.residues()):
+            if resid in self.lig_res_ids:
+                for atom in residue.atoms():
+                    lig_atom_ids.append(atom.index)
+
+        # Copy all steric interactions into the custom force, and remove them from the original force
+        for atom_idx in range(self.nonbonded_force.getNumParticles()):
+            # Get atom parameters
+            [charge, sigma, epsilon] = self.nonbonded_force.getParticleParameters(atom_idx)
+
+            # Make sure that sigma is not equal to zero
+            if np.isclose(sigma._value, 0.0):
+                sigma = 1.0 * unit.angstrom
+
+            # Add particle to the custom force (with lambda=1 for now)
+            if atom_idx in lig_atom_ids:
+                custom_nonbonded_force.addParticle([1.0, sigma, epsilon, 1.0])
+            else:
+                custom_nonbonded_force.addParticle([2.0, sigma, epsilon, 1.0])
+
+        # Copy over all exceptions into the new force as exclusions
+        # Exceptions between non-ligand atoms will be excluded here, and handled by the NonbondedForce
+        # If exceptions (other than ignored interactions) are found involving ligand atoms, we have a problem
+        for exception_idx in range(self.nonbonded_force.getNumExceptions()):
+            [i, j, chargeprod, sigma, epsilon] = self.nonbonded_force.getExceptionParameters(exception_idx)
+
+            # If epsilon is greater than zero, this is a non-zero exception, which must be checked
+            if epsilon > 0.0 * unit.kilojoule_per_mole:
+                if i in lig_atom_ids or j in lig_atom_ids:
+                    self.raiseError("Non-zero exception interaction found involving water atoms ({} & {}). grand is"
+                                    " not currently able to support this".format(i, j))
+
+            # Add this to the list of exclusions
+            custom_nonbonded_force.addExclusion(i, j)
+
+        # Update system
+        self.system.addForce(custom_nonbonded_force)
+        self.system.removeForce(self.nonbonded_force)
+        self.nonbonded_force = custom_nonbonded_force
+
+        return None
+
 
     def adjust_specific_ligand(self, atoms, params, mode):
         for atom_id in atoms:
@@ -175,14 +271,15 @@ class BaseGCMCSampler(object):
             self.context.setPositions(new_positions)
             self.adjust_specific_ligand(atoms,self.lig_params,mode='on')
             self.nonbonded_force.updateParametersInContext(self.context)
-            print(self.context.getState(getEnergy=True).getPotentialEnergy())
+            print(self.energy)
+            #print(self.context.getState(getEnergy=True).getPotentialEnergy())
             #self.context.setVelocitiesToTemperature(self.temperature)
-            #self.simulation.step(1000)
-            self.simulation.minimizeEnergy()
+            self.simulation.step(10000)
+            #self.simulation.minimizeEnergy(maxIterations=10)
             new_energy = self.context.getState(getEnergy=True).getPotentialEnergy()
             #new_velocities = self.context.getState(getVelocities=True).getVelocities()
             print(new_energy)
-            acc_prob = math.exp(self.B) * math.exp(-(new_energy - self.energy) / self.kT) / (self.N + 1)
+            acc_prob = math.exp(self.B -(new_energy - self.energy) / self.kT) / (self.N + 1)
             if acc_prob < np.random.rand() or np.isnan(acc_prob):
                 self.adjust_specific_ligand(atoms,self.lig_params,mode='off')
                 self.context.setPositions(self.positions)
@@ -217,3 +314,4 @@ class BaseGCMCSampler(object):
                 self.energy = new_energy
 
 
+#class BaseGCNCMCSampler(object):

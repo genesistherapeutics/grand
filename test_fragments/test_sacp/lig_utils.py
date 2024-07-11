@@ -2,8 +2,10 @@ import os
 import numpy as np
 import mdtraj
 import parmed
+import openmm
 from openmm import unit
 from openmm import app
+from openmmtools.constants import ONE_4PI_EPS0
 from copy import deepcopy
 from scipy.cluster import hierarchy
 import warnings
@@ -62,7 +64,7 @@ def add_ghosts(prot_top, prot_pos, lig_top, lig_pos, n=10, output='gcmc-ghosts.p
 
     # Add multiple copies of the same water, then write out a pdb (for visualisation)
     ghosts = []        
-    new_centres = box_size
+    new_centres = np.random.rand(n,3) * unit.nanometer * 10 + box_size
     for idx in tqdm.tqdm(range(n)):
         # Need to translate the water to a random point in the simulation box]
         new_positions = deepcopy(lig_pos)
@@ -142,3 +144,43 @@ def rotate_molecule(positions, atom_indices, insert_point=None):
         else:
             new_positions[index] = atom_position
     return new_positions
+
+#TODO: Double-check custom nb is correct
+#TODO: add appropriate global parameters
+def custom_nonbonded_force(alpha_ewald, cutoff_distance):
+    #CustomNonbondedForce with LJ and Coulomb terms
+    energy_expression  = "select(condition,1,0)*all;"
+    energy_expression += "condition = soluteFlag1*soluteFlag2;" #solute must have flag int(1)
+    energy_expression += "all=4*epsilon*((sigma/r)^12 - (sigma/r)^6) + ONE_4PI_EPS0*chargeprod*erfc(alpha_ewald*r)/r;"
+    energy_expression += "epsilon = epsilon1*epsilon2;"
+    energy_expression += "sigma = 0.5*(sigma1+sigma2);"
+    energy_expression += "ONE_4PI_EPS0 = {:f};".format(ONE_4PI_EPS0)  # already in OpenMM units
+    energy_expression += "chargeprod = charge1*charge2;"
+    energy_expression += "alpha_ewald = {:f};".format(alpha_ewald.value_in_unit_system(unit.md_unit_system))
+    custom_nonbonded_force = openmm.CustomNonbondedForce(energy_expression)
+    custom_nonbonded_force.addPerParticleParameter('soluteFlag')
+    custom_nonbonded_force.addPerParticleParameter('charge')
+    custom_nonbonded_force.addPerParticleParameter('sigma')
+    custom_nonbonded_force.addPerParticleParameter('epsilon')
+    # Configure force
+    custom_nonbonded_force.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
+    custom_nonbonded_force.setCutoffDistance(1*unit.nanometer)
+    
+    custom_nonbonded_force.setUseLongRangeCorrection(False)
+    custom_nonbonded_force.setUseSwitchingFunction(True)
+    custom_nonbonded_force.setSwitchingDistance(cutoff_distance - 1.0*unit.angstroms)
+
+    #Now must add a bond force to handle exceptions.
+    #(exceptions are altered interactions - but not completely
+    #removed! Also PME is not required now.
+    energy_expression  = "scalingFactor*all;"
+    energy_expression += "all=4*epsilon*((sigma/r)^12 - (sigma/r)^6) + ONE_4PI_EPS0*chargeprod/r;"
+    energy_expression += "ONE_4PI_EPS0 = {:f};".format(ONE_4PI_EPS0)  # already in OpenMM units
+    custom_bond_force = openmm.CustomBondForce(energy_expression)
+    custom_bond_force.addGlobalParameter('scalingFactor', 1)
+    custom_bond_force.addEnergyParameterDerivative('scalingFactor')
+    custom_bond_force.addPerBondParameter('chargeprod')
+    custom_bond_force.addPerBondParameter('sigma')
+    custom_bond_force.addPerBondParameter('epsilon')
+
+    return custom_nonbonded_force, custom_bond_force
