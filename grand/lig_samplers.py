@@ -82,7 +82,7 @@ class BaseGCMCSampler(object):
                     self.lig_atom_ids[resid].append(atom.index)
         self.lig_params = defaultdict(list)
         
-        self.customize_forces()
+        #self.customize_forces()
         i = 1
         for force in self.system.getForces():
             force.setForceGroup(i)
@@ -122,7 +122,14 @@ class BaseGCMCSampler(object):
                 soluteFlag, charge, sigma, eps, l = self.nonbonded_force.getParticleParameters(atom_id)
                 self.lig_params[atom_id] = [charge, sigma, eps]
                 self.nonbonded_force.setParticleParameters(atom_id, [1., 0., sigma, 0., 1.])
-        #self.nonbonded_force.updateParametersInContext(self.context)
+        self.turn_off_steric()
+        self.nonbonded_force.updateParametersInContext(self.context)
+        for atom_idx in range(self.nonbonded_force.getNumParticles()):
+            # Get atom parameters
+            [charge, sigma, epsilon] = self.nonbonded_force.getParticleParameters(atom_idx)
+            if charge._value != 0.:
+                print(charge, epsilon)
+            #print(charge,epsilon)
         #self.simulation.minimizeEnergy(maxIterations=10)
         #self.simulation.step(100)
         for f in range(self.system.getNumForces()):
@@ -142,6 +149,15 @@ class BaseGCMCSampler(object):
         self.min_dimension = self.prot_positions.min() - np.array([0.3,0.3,0.3]) * unit.nanometer
         self.max_dimension = self.prot_positions.max() + np.array([0.3,0.3,0.3]) * unit.nanometer
         #self.customize_forces()
+
+    def turn_off_steric(self):
+        """
+        For debugging purpose
+        """
+        for atom_idx in range(self.nonbonded_force.getNumParticles()):
+            # Get atom parameters
+            [charge, sigma, epsilon] = self.nonbonded_force.getParticleParameters(atom_idx)
+            self.nonbonded_force.setParticleParameters(atom_idx,abs(0),sigma,abs(0))
 
     def customize_forces(self):
         """
