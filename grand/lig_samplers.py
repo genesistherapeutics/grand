@@ -59,6 +59,7 @@ class BaseGCMCSampler(object):
             force = system.getForce(f)
             if force.__class__.__name__ == "NonbondedForce":
                 self.nonbonded_force = force
+                self.nonbonded_force_index = f
             # Flag an error if not simulating at constant volume
             elif "Barostat" in force.__class__.__name__:
                 self.raiseError("GCMC must be used at constant volume - {} cannot be used!".format(force.__class__.__name__))
@@ -80,6 +81,14 @@ class BaseGCMCSampler(object):
                 for atom in residue.atoms():
                     self.lig_atom_ids[resid].append(atom.index)
         self.lig_params = defaultdict(list)
+        
+        self.customize_forces()
+        i = 1
+        for force in self.system.getForces():
+            force.setForceGroup(i)
+            i += 1
+        #self.customize_forces()
+        
         #for lig_res_id in self.lig_atom_ids.keys():
         #    for atom_id in self.lig_atom_ids[lig_res_id]:
         #        charge, simga, eps = self.nonbonded_force.getParticleParameters(atom_id)
@@ -87,7 +96,7 @@ class BaseGCMCSampler(object):
         #        self.nonbonded_force.setParticleParameters(atom_id, 0., 0., 0.,)
 
     def initialize(self,B, positions,integrator,reporter=None, ghosts=None):
-        self.B = B
+        self.B = B * unit.kilojoules_per_mole
         self.positions = positions
         self.simulation = openmm.app.Simulation(
             self.topology,
@@ -110,10 +119,17 @@ class BaseGCMCSampler(object):
         self.lig_params = defaultdict(list)
         for lig_res_id in self.lig_atom_ids.keys():
             for atom_id in self.lig_atom_ids[lig_res_id]:
-                charge, simga, eps = self.nonbonded_force.getParticleParameters(atom_id)
-                self.lig_params[atom_id] = [charge, simga, eps]
-                self.nonbonded_force.setParticleParameters(atom_id, 0., 0., 0.,)
-        self.nonbonded_force.updateParametersInContext(self.context)
+                soluteFlag, charge, sigma, eps, l = self.nonbonded_force.getParticleParameters(atom_id)
+                self.lig_params[atom_id] = [charge, sigma, eps]
+                self.nonbonded_force.setParticleParameters(atom_id, [1., 0., sigma, 0., 1.])
+        #self.nonbonded_force.updateParametersInContext(self.context)
+        #self.simulation.minimizeEnergy(maxIterations=10)
+        #self.simulation.step(100)
+        for f in range(self.system.getNumForces()):
+            print(self.system.getForce(f).__class__.__name__)
+            force_group = self.system.getForce(f).getForceGroup()
+            print(force_group)
+            print(self.context.getState(getEnergy=True,groups={force_group}).getPotentialEnergy())
         self.energy = self.context.getState(getEnergy=True).getPotentialEnergy()
         print(f'Initial Energy: {self.energy}')
         if reporter:
@@ -123,10 +139,9 @@ class BaseGCMCSampler(object):
         else:
             self.ghost_lig_res_ids = self.lig_res_ids
         # padding
-        self.min_dimension = self.prot_positions.min() - np.array([1,1,1]) * unit.nanometer
-        self.max_dimension = self.prot_positions.max() + np.array([1,1,1]) * unit.nanometer
-
-        self.velocities = self.context.getState(getVelocities=True).getVelocities()
+        self.min_dimension = self.prot_positions.min() - np.array([0.3,0.3,0.3]) * unit.nanometer
+        self.max_dimension = self.prot_positions.max() + np.array([0.3,0.3,0.3]) * unit.nanometer
+        #self.customize_forces()
 
     def customize_forces(self):
         """
@@ -135,16 +150,17 @@ class BaseGCMCSampler(object):
         For custom coulomb force, cufoff periodic with reaction field will be used
         These custom forces are applied to turn off ligand-ligand interactions
         """
-        if self.nonbonded_force.getNonbondedMethod() != openmm.NonbondedForce.CutoffPeriodic:
-            self.raiseError("Currently only supporting CutoffPeriodic for long range electrostatics")
-        else:
-            eps_solvent = self.nonbonded_force.getReactionFieldDielectric()
-            cutoff = self.nonbonded_force.getCutoffDistance()
-            krf = (1/ (cutoff**3)) * (eps_solvent - 1) / (2*eps_solvent + 1)
-            crf = (1/ cutoff) * (3* eps_solvent) / (2*eps_solvent + 1)
+        #if self.nonbonded_force.getNonbondedMethod() != openmm.NonbondedForce.CutoffPeriodic:
+        #    self.raiseError("Currently only supporting CutoffPeriodic for long range electrostatics")
+        #else:
+        eps_solvent = self.nonbonded_force.getReactionFieldDielectric()
+        cutoff = self.nonbonded_force.getCutoffDistance()
+        krf = (1/ (cutoff**3)) * (eps_solvent - 1) / (2*eps_solvent + 1)
+        crf = (1/ cutoff) * (3* eps_solvent) / (2*eps_solvent + 1)
+        print(krf,crf,ONE_4PI_EPS0)
 
         energy_expression  = "select(condition, 0, 1)*all;"
-        energy_expression += "condition = soluteFlag2*soluteFlag2;" #solute must have flag int(1)
+        energy_expression += "condition = soluteFlag1*soluteFlag2;" #solute must have flag int(1)
         energy_expression += "all=(lambda^soft_a) * 4 * epsilon * x * (x-1.0) + ONE_4PI_EPS0*chargeprod*(1/r + krf*r*r - crf);"
         energy_expression += "x = (sigma/reff)^6;"  # Define x as sigma/r(effective)
         energy_expression += "reff = sigma*((soft_alpha*(1.0-lambda)^soft_b + (r/sigma)^soft_c))^(1/soft_c);" # Calculate effective distance
@@ -163,18 +179,17 @@ class BaseGCMCSampler(object):
         custom_nonbonded_force.addPerParticleParameter('lambda')
         # Configure force
         custom_nonbonded_force.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
-        custom_nonbonded_force.setCutoffDistance(1*unit.amount_dimensionnanometer)
+        custom_nonbonded_force.setUseSwitchingFunction(self.nonbonded_force.getUseSwitchingFunction())
+        custom_nonbonded_force.setCutoffDistance(self.nonbonded_force.getCutoffDistance())
+        custom_nonbonded_force.setSwitchingDistance(self.nonbonded_force.getSwitchingDistance())
         self.nonbonded_force.setUseDispersionCorrection(False)
         custom_nonbonded_force.setUseLongRangeCorrection(self.nonbonded_force.getUseDispersionCorrection())
-        custom_nonbonded_force.setUseSwitchingFunction(self.nonbonded_force.getUseSwitchingFunction())
-        custom_nonbonded_force.setSwitchingDistance(self.nonbonded_force.getSwitchingDistance())
         # Set softcore parameters
         custom_nonbonded_force.addGlobalParameter('soft_alpha', 0.5)
         custom_nonbonded_force.addGlobalParameter('soft_a', 1)
         custom_nonbonded_force.addGlobalParameter('soft_b', 1)
         custom_nonbonded_force.addGlobalParameter('soft_c', 6)
 
-        #TODO need to change
         lig_atom_ids = []
         for resid, residue in enumerate(self.topology.residues()):
             if resid in self.lig_res_ids:
@@ -187,14 +202,14 @@ class BaseGCMCSampler(object):
             [charge, sigma, epsilon] = self.nonbonded_force.getParticleParameters(atom_idx)
 
             # Make sure that sigma is not equal to zero
-            if np.isclose(sigma._value, 0.0):
-                sigma = 1.0 * unit.angstrom
+            #if np.isclose(sigma._value, 0.0):
+            #    sigma = 1.0 * unit.angstrom
 
             # Add particle to the custom force (with lambda=1 for now)
             if atom_idx in lig_atom_ids:
-                custom_nonbonded_force.addParticle([1.0, sigma, epsilon, 1.0])
+                custom_nonbonded_force.addParticle([1.0, charge, sigma, epsilon, 1.0])
             else:
-                custom_nonbonded_force.addParticle([2.0, sigma, epsilon, 1.0])
+                custom_nonbonded_force.addParticle([0.0, charge, sigma, epsilon, 1.0])
 
         # Copy over all exceptions into the new force as exclusions
         # Exceptions between non-ligand atoms will be excluded here, and handled by the NonbondedForce
@@ -212,9 +227,12 @@ class BaseGCMCSampler(object):
             custom_nonbonded_force.addExclusion(i, j)
 
         # Update system
-        self.system.addForce(custom_nonbonded_force)
-        self.system.removeForce(self.nonbonded_force)
+        new_index = self.system.addForce(custom_nonbonded_force)
+        print(self.nonbonded_force_index, new_index)
+        print(self.system.getForce(self.nonbonded_force_index))
+        self.system.removeForce(self.nonbonded_force_index)
         self.nonbonded_force = custom_nonbonded_force
+        self.nonbonded_force_index = new_index
 
         return None
 
@@ -224,14 +242,14 @@ class BaseGCMCSampler(object):
             if mode == 'on':
                 charge, sigma, eps = params[atom_id]
             elif mode == 'off':
+                charge, sigma, eps = params[atom_id]
                 charge = 0.
-                sigma = 0.
                 eps = 0.
             else:
                 error_msg = 'Mode should be either on or off'
                 self.logger.error(error_msg)
                 raise ValueError(error_msg)
-            self.nonbonded_force.setParticleParameters(atom_id, charge, sigma, eps)
+            self.nonbonded_force.setParticleParameters(atom_id, [1., charge, sigma, eps, 1.])
         self.nonbonded_force.updateParametersInContext(self.context)
 
     def insert(self, atoms, insert_point=None, random_rotate=True):
@@ -258,7 +276,7 @@ class BaseGCMCSampler(object):
         self.adjust_specific_ligand(atoms,self.lig_params,mode='off')
 
     def move(self):
-        if np.random.randint(2) == 1:
+        if np.random.randint(1) == 0:
             # Insert
             res_id = np.random.choice(self.ghost_lig_res_ids)
             atoms = self.lig_atom_ids[res_id]
@@ -266,7 +284,7 @@ class BaseGCMCSampler(object):
             #    charge, sigma, eps = self.lig_params[atom_id]
             #    self.nonbonded_force.setParticleParameters(atom_id, charge, sigma, eps)
             #insert_point = (np.random.rand(3) * self.simulation_box)
-            insert_point = (np.random.rand(3) * (self.max_dimension - self.min_dimension)._value) * unit.nanometer + self.min_dimension
+            insert_point = (np.random.rand(3) * (self.max_dimension - self.min_dimension).value_in_unit(unit.nanometer)) * unit.nanometer + self.min_dimension
             new_positions = self.insert(atoms, insert_point)
             self.context.setPositions(new_positions)
             self.adjust_specific_ligand(atoms,self.lig_params,mode='on')
@@ -274,13 +292,18 @@ class BaseGCMCSampler(object):
             print(self.energy)
             #print(self.context.getState(getEnergy=True).getPotentialEnergy())
             #self.context.setVelocitiesToTemperature(self.temperature)
-            self.simulation.step(10000)
-            #self.simulation.minimizeEnergy(maxIterations=10)
+            #self.simulation.step(100)
+            self.simulation.minimizeEnergy(maxIterations=100)
             new_energy = self.context.getState(getEnergy=True).getPotentialEnergy()
             #new_velocities = self.context.getState(getVelocities=True).getVelocities()
+            #self.reporter.report(self.simulation,self.context.getState(getPositions=True,getEnergy=True))
             print(new_energy)
-            acc_prob = math.exp(self.B -(new_energy - self.energy) / self.kT) / (self.N + 1)
-            if acc_prob < np.random.rand() or np.isnan(acc_prob):
+            #try:
+            #    acc_prob = math.exp(self.B -(new_energy - self.energy) / self.kT) / (self.N + 1)
+            #except OverflowError:
+            #    acc_prob = float('inf')
+            log_acc_prob = (self.B - new_energy + self.energy)/self.kT - self.N - 1
+            if log_acc_prob < np.log(np.random.rand()) or np.isnan(log_acc_prob):
                 self.adjust_specific_ligand(atoms,self.lig_params,mode='off')
                 self.context.setPositions(self.positions)
             else:
@@ -293,6 +316,7 @@ class BaseGCMCSampler(object):
                 # Update energy
                 self.energy = new_energy
                 #self.velocities = new_velocities
+                self.reporter.report(self.simulation,self.context.getState(getPositions=True,getEnergy=True))
         elif len(self.real_lig_res_ids) != 0:
             # Delete
             res_id = np.random.choice(self.real_lig_res_ids)
@@ -312,6 +336,22 @@ class BaseGCMCSampler(object):
                 self.real_lig_res_ids.remove(res_id)
                 # Update energy
                 self.energy = new_energy
+
+    def raiseError(self, error_msg):
+        """
+        Make it nice and easy to report an error in a consisent way - also easier to manage error handling in future
+
+        Parameters
+        ----------
+        error_msg : str
+            Message describing the error
+        """
+        # Write to the log file
+        self.logger.error(error_msg)
+        # Raise an Exception
+#        raise Exception(error_msg)
+
+        return None
 
 
 #class BaseGCNCMCSampler(object):
