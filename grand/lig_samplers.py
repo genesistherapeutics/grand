@@ -82,7 +82,7 @@ class BaseGCMCSampler(object):
                     self.lig_atom_ids[resid].append(atom.index)
         self.lig_params = defaultdict(list)
         
-        #self.customize_forces()
+        self.customize_forces()
         i = 1
         for force in self.system.getForces():
             force.setForceGroup(i)
@@ -122,16 +122,21 @@ class BaseGCMCSampler(object):
                 soluteFlag, charge, sigma, eps, l = self.nonbonded_force.getParticleParameters(atom_id)
                 self.lig_params[atom_id] = [charge, sigma, eps]
                 self.nonbonded_force.setParticleParameters(atom_id, [1., 0., sigma, 0., 1.])
-        self.turn_off_steric()
-        self.nonbonded_force.updateParametersInContext(self.context)
-        for atom_idx in range(self.nonbonded_force.getNumParticles()):
+        #self.turn_off_steric()
+        #self.nonbonded_force.updateParametersInContext(self.context)
+        """ for atom_idx in range(self.nonbonded_force.getNumParticles()):
             # Get atom parameters
             [charge, sigma, epsilon] = self.nonbonded_force.getParticleParameters(atom_idx)
             if charge._value != 0.:
                 print(charge, epsilon)
+            if epsilon._value != 0.:
+                print(charge, epsilon) """
             #print(charge,epsilon)
         #self.simulation.minimizeEnergy(maxIterations=10)
         #self.simulation.step(100)
+        #for exp_idx in range(self.nonbonded_force.getNumExceptions()):
+        #    print(self.nonbonded_force.getExceptionParameters(exp_idx))
+
         for f in range(self.system.getNumForces()):
             print(self.system.getForce(f).__class__.__name__)
             force_group = self.system.getForce(f).getForceGroup()
@@ -218,8 +223,8 @@ class BaseGCMCSampler(object):
             [charge, sigma, epsilon] = self.nonbonded_force.getParticleParameters(atom_idx)
 
             # Make sure that sigma is not equal to zero
-            #if np.isclose(sigma._value, 0.0):
-            #    sigma = 1.0 * unit.angstrom
+            if np.isclose(sigma._value, 0.0):
+                sigma = 1.0 * unit.angstrom
 
             # Add particle to the custom force (with lambda=1 for now)
             if atom_idx in lig_atom_ids:
@@ -227,9 +232,18 @@ class BaseGCMCSampler(object):
             else:
                 custom_nonbonded_force.addParticle([0.0, charge, sigma, epsilon, 1.0])
 
-        # Copy over all exceptions into the new force as exclusions
+        # Copy over all exceptions into the new force as custom bonded forces
         # Exceptions between non-ligand atoms will be excluded here, and handled by the NonbondedForce
         # If exceptions (other than ignored interactions) are found involving ligand atoms, we have a problem
+        energy_expression = "4*epsilon*((sigma/r)^12 - (sigma/r)^6) + ONE_4PI_EPS0*chargeprod*(1/r + krf*r*r - crf);"
+        energy_expression += "ONE_4PI_EPS0 = {:f};".format(ONE_4PI_EPS0)
+        energy_expression += "krf = {:f};".format(krf.value_in_unit(unit.nanometer**-3))
+        energy_expression += "crf = {:f};".format(crf.value_in_unit(unit.nanometer**-1))
+        custom_bond_force = openmm.CustomBondForce(energy_expression)
+        custom_bond_force.addPerBondParameter('chargeprod')
+        custom_bond_force.addPerBondParameter('sigma')
+        custom_bond_force.addPerBondParameter('epsilon')
+        
         for exception_idx in range(self.nonbonded_force.getNumExceptions()):
             [i, j, chargeprod, sigma, epsilon] = self.nonbonded_force.getExceptionParameters(exception_idx)
 
@@ -241,9 +255,11 @@ class BaseGCMCSampler(object):
 
             # Add this to the list of exclusions
             custom_nonbonded_force.addExclusion(i, j)
+            custom_bond_force.addBond(i, j, [chargeprod, sigma, epsilon])
 
         # Update system
         new_index = self.system.addForce(custom_nonbonded_force)
+        self.system.addForce(custom_bond_force)
         print(self.nonbonded_force_index, new_index)
         print(self.system.getForce(self.nonbonded_force_index))
         self.system.removeForce(self.nonbonded_force_index)
