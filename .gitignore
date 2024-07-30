@@ -11,3 +11,4 @@ grand/tests/output/*
 docs/Makefile
 docs/make.bat
 **/*.dcd
+test_fragments/*

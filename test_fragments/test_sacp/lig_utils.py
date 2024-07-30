@@ -64,7 +64,7 @@ def add_ghosts(prot_top, prot_pos, lig_top, lig_pos, n=10, output='gcmc-ghosts.p
 
     # Add multiple copies of the same water, then write out a pdb (for visualisation)
     ghosts = []        
-    new_centres = np.random.rand(n,3) * unit.nanometer * 10 + box_size
+    new_centres = np.zeros((n,3)) * unit.nanometer  + np.random.rand(n,3) * unit.nanometer #* 10 + box_size
     for idx in tqdm.tqdm(range(n)):
         # Need to translate the water to a random point in the simulation box]
         new_positions = deepcopy(lig_pos)
@@ -81,13 +81,12 @@ def add_ghosts(prot_top, prot_pos, lig_top, lig_pos, n=10, output='gcmc-ghosts.p
     # Renumber all ghost waters and assign them to the new chain
     for resid, residue in enumerate(modeller.topology.residues()):
         if resid in ghosts:
-            residue.id = str(((resid - 1) % 9999) + 1)
-            residue.chain.id = new_chain
+            residue.id = str(((resid) % 9999) + 1)
+            residue.chain.id = 'A'
 
     # Write the new topology and positions to a PDB file
     if output is not None:
-        with open(output, 'w') as f:
-            app.PDBFile.writeFile(topology=modeller.topology, positions=modeller.positions, file=f, keepIds=True)
+        openmm.app.PDBFile.writeFile(topology=modeller.topology, positions=modeller.positions, file=output, keepIds=True)
 
     return modeller.topology, modeller.positions, ghosts
 
@@ -149,7 +148,7 @@ def rotate_molecule(positions, atom_indices, insert_point=None):
 #TODO: add appropriate global parameters
 def custom_nonbonded_force(alpha_ewald, cutoff_distance):
     #CustomNonbondedForce with LJ and Coulomb terms
-    energy_expression  = "select(condition,1,0)*all;"
+    energy_expression  = "select(condition,0,1)*all;"
     energy_expression += "condition = soluteFlag1*soluteFlag2;" #solute must have flag int(1)
     energy_expression += "all=4*epsilon*((sigma/r)^12 - (sigma/r)^6) + ONE_4PI_EPS0*chargeprod*erfc(alpha_ewald*r)/r;"
     energy_expression += "epsilon = epsilon1*epsilon2;"
