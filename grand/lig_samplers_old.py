@@ -28,15 +28,14 @@ class BaseGCMCSampler(object):
     Base class for carrying out GCMC moves in OpenMM.
     All other Sampler objects are derived from this
     """
-    def __init__(self, system, topology, temperature, ligands=[], log='gcmc.log', overwrite=False,
-                 B=-6., insert_prob=0.5, positions=None,integrator=None,reporter=None, ghosts=None,
-                 water_resn='HOH'):
+    def __init__(self, system, topology, temperature, ligands, log='gcmc.log', overwrite=False):
         # Create logging object
         if os.path.isfile(log):
             if overwrite:
                 os.remove(log)
             else:
                 raise Exception("File {} already exists, not overwriting...".format(log))
+        
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.DEBUG)
         file_handler = logging.FileHandler(log)
@@ -44,20 +43,15 @@ class BaseGCMCSampler(object):
         file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s: %(message)s'))
         self.logger.addHandler(file_handler)
 
-        # Set OpenMM system variables
+        # Set simulation variables
         self.system = system
         self.topology = topology
-        self.positions = positions
-        i = 1
-        for force in self.system.getForces():
-            force.setForceGroup(i)
-            i += 1
-
-        # Set GCMC related variables
-        self.B = B
+        self.positions = None
+        self.context = None
         self.temperature = temperature
-        self.insert_prob = insert_prob
         self.kT = unit.BOLTZMANN_CONSTANT_kB * unit.AVOGADRO_CONSTANT_NA * temperature
+        self.simulation_box = np.zeros(3) * unit.nanometer
+
         self.logger.info(f'kT = {self.kT.in_units_of(unit.kilocalorie_per_mole)}')
 
         # Find NonbondedForce - needs to be updated to switch waters on/off
@@ -77,33 +71,34 @@ class BaseGCMCSampler(object):
         self.n_accepted = 0
         self.acceptance_probabilities = []  # Store acceptance probabilities
         
-        # Store ligand/water/protein related variables
+        # Store ligand parameters
         self.lig_res_ids = ligands
-        if ghosts:
-            self.ghost_lig_res_ids = ghosts
-        else:
-            self.ghost_lig_res_ids = self.lig_res_ids
+        self.ghost_lig_res_ids = []
         self.real_lig_res_ids = []
         self.lig_atom_ids = defaultdict(list)
-        self.wat_atom_ids = defaultdict(list)
-        self.prot_positions = []
         for resid, residue in enumerate(topology.residues()):
             if resid in self.lig_res_ids:
                 for atom in residue.atoms():
                     self.lig_atom_ids[resid].append(atom.index)
-            elif residue.name == water_resn:
-                self.water_res_ids.append(resid)
-                for atom in residue.atoms():
-                    self.wat_atom_ids[resid].append(atom.index)
-            else:
-                for atom in residue.atoms():
-                    self.prot_positions.append(self.positions[atom.index])
-        self.prot_positions = unit.Quantity(self.prot_positions)
-
-        # Customize force so that ligand-ligand interaction can be ignored
+        self.lig_params = defaultdict(list)
+        
         self.customize_forces()
+        i = 1
+        for force in self.system.getForces():
+            force.setForceGroup(i)
+            i += 1
+        #self.customize_forces()
+        
+        #for lig_res_id in self.lig_atom_ids.keys():
+        #    for atom_id in self.lig_atom_ids[lig_res_id]:
+        #        charge, simga, eps = self.nonbonded_force.getParticleParameters(atom_id)
+        #        self.lig_params[atom_id] = [charge, simga, eps]
+        #        self.nonbonded_force.setParticleParameters(atom_id, 0., 0., 0.,)
 
-        # Set OpenMM simulation variables
+    def initialize(self,B, insert_prob, positions,integrator,reporter=None, ghosts=None):
+        self.B = B #* unit.kilojoules_per_mole
+        self.insert_prob = insert_prob
+        self.positions = positions
         self.simulation = openmm.app.Simulation(
             self.topology,
             self.system,    
@@ -112,21 +107,39 @@ class BaseGCMCSampler(object):
         )
         self.context = self.simulation.context
         self.context.setPositions(self.positions)
-        if reporter:
-            self.reporter = reporter
-            self.simulation.reporters.append(self.reporter)
-
-
-        # Get forcefield parameters per atom and store it as a dict
+        self.lig_atom_ids = defaultdict(list)
+        self.prot_positions = []
+        for resid, residue in enumerate(self.topology.residues()):
+            if resid in self.lig_res_ids:
+                for atom in residue.atoms():
+                    self.lig_atom_ids[resid].append(atom.index)
+            elif residue.name == 'HOH':
+                pass
+            else:
+                for atom in residue.atoms():
+                    self.prot_positions.append(self.positions[atom.index])
+        self.prot_positions = unit.Quantity(self.prot_positions)
         self.lig_params = defaultdict(list)
         for lig_res_id in self.lig_atom_ids.keys():
             for atom_id in self.lig_atom_ids[lig_res_id]:
                 soluteFlag, charge, sigma, eps, l = self.nonbonded_force.getParticleParameters(atom_id)
                 self.lig_params[atom_id] = [charge, sigma, eps]
                 self.nonbonded_force.setParticleParameters(atom_id, [1., 0., sigma, 0., 0.])
-        self.nonbonded_force.updateParametersInContext(self.context)
+        #self.turn_off_steric()
+        #self.nonbonded_force.updateParametersInContext(self.context)
+        """ for atom_idx in range(self.nonbonded_force.getNumParticles()):
+            # Get atom parameters
+            [charge, sigma, epsilon] = self.nonbonded_force.getParticleParameters(atom_idx)
+            if charge._value != 0.:
+                print(charge, epsilon)
+            if epsilon._value != 0.:
+                print(charge, epsilon) """
+            #print(charge,epsilon)
+        #self.simulation.minimizeEnergy(maxIterations=10)
+        #self.simulation.step(100)
+        #for exp_idx in range(self.nonbonded_force.getNumExceptions()):
+        #    print(self.nonbonded_force.getExceptionParameters(exp_idx))
 
-        # Compute energy and forces
         for f in range(self.system.getNumForces()):
             print(self.system.getForce(f).__class__.__name__)
             force_group = self.system.getForce(f).getForceGroup()
@@ -134,13 +147,25 @@ class BaseGCMCSampler(object):
             print(self.context.getState(getEnergy=True,groups={force_group}).getPotentialEnergy())
         self.energy = self.context.getState(getEnergy=True).getPotentialEnergy()
         print(f'Initial Energy: {self.energy}')
-
-
-        # Define simualtion box/GCMC box
-        # This was set to be a box around a protein with a padding of n angstrom
-        self.simulation_box = np.zeros(3) * unit.nanometer
+        if reporter:
+            self.reporter = reporter
+        if ghosts:
+            self.ghost_lig_res_ids = ghosts
+        else:
+            self.ghost_lig_res_ids = self.lig_res_ids
+        # padding
         self.min_dimension = self.prot_positions.min() - np.array([0.3,0.3,0.3]) * unit.nanometer
         self.max_dimension = self.prot_positions.max() + np.array([0.3,0.3,0.3]) * unit.nanometer
+        #self.customize_forces()
+
+    def turn_off_steric(self):
+        """
+        For debugging purpose
+        """
+        for atom_idx in range(self.nonbonded_force.getNumParticles()):
+            # Get atom parameters
+            [charge, sigma, epsilon] = self.nonbonded_force.getParticleParameters(atom_idx)
+            self.nonbonded_force.setParticleParameters(atom_idx,abs(0),sigma,abs(0))
 
     def customize_forces(self):
         """
@@ -156,6 +181,7 @@ class BaseGCMCSampler(object):
         cutoff = self.nonbonded_force.getCutoffDistance()
         krf = (1/ (cutoff**3)) * (eps_solvent - 1) / (2*eps_solvent + 1)
         crf = (1/ cutoff) * (3* eps_solvent) / (2*eps_solvent + 1)
+        print(krf,crf,ONE_4PI_EPS0)
 
         energy_expression  = "select(condition, 0, 1)*all;"
         energy_expression += "condition = soluteFlag1*soluteFlag2;" #solute must have flag int(1)
@@ -189,18 +215,24 @@ class BaseGCMCSampler(object):
         custom_nonbonded_force.addGlobalParameter('soft_c', 6)
 
         lig_atom_ids = []
+        water_atom_ids = []
         for resid, residue in enumerate(self.topology.residues()):
             if resid in self.lig_res_ids:
                 for atom in residue.atoms():
                     lig_atom_ids.append(atom.index)
+            elif residue.name == 'HOH':
+                for atom in residue.atoms():
+                    water_atom_ids.append(atom.index)
 
         # Copy all steric interactions into the custom force, and remove them from the original force
         for atom_idx in range(self.nonbonded_force.getNumParticles()):
             # Get atom parameters
             [charge, sigma, epsilon] = self.nonbonded_force.getParticleParameters(atom_idx)
+
             # Make sure that sigma is not equal to zero
             if np.isclose(sigma._value, 0.0):
                 sigma = 1.0 * unit.angstrom
+
             # Add particle to the custom force (with lambda=1 for now)
             if atom_idx in lig_atom_ids:
                 custom_nonbonded_force.addParticle([1.0, charge, sigma, epsilon, 1.0])
@@ -217,18 +249,31 @@ class BaseGCMCSampler(object):
         custom_bond_force.addPerBondParameter('sigma')
         custom_bond_force.addPerBondParameter('epsilon')
         
+
+        print('n_exception',self.nonbonded_force.getNumExceptions())
+        count = 0
         for exception_idx in range(self.nonbonded_force.getNumExceptions()):
             [i, j, chargeprod, sigma, epsilon] = self.nonbonded_force.getExceptionParameters(exception_idx)
+
             # Add this to the list of exclusions
             custom_nonbonded_force.addExclusion(i, j)
+
             if i in lig_atom_ids and j in lig_atom_ids:
+                count += 1
                 pass
+            elif i in water_atom_ids or j in water_atom_ids:
+                print(i, j, chargeprod, sigma, epsilon)
+                if epsilon > 0.0 * unit.kilojoule_per_mole:
+                    print('problem')
             else:
                 custom_bond_force.addBond(i, j, [chargeprod, sigma, epsilon])
+        print(count)
 
         # Update system
         new_index = self.system.addForce(custom_nonbonded_force)
         self.system.addForce(custom_bond_force)
+        print(self.nonbonded_force_index, new_index)
+        print(self.system.getForce(self.nonbonded_force_index))
         self.system.removeForce(self.nonbonded_force_index)
         self.nonbonded_force = custom_nonbonded_force
         self.nonbonded_force_index = new_index
@@ -236,7 +281,7 @@ class BaseGCMCSampler(object):
         return None
 
 
-    def adjust_specific_ligand(self, atoms, params, mode, l=1.0):
+    def adjust_specific_ligand(self, atoms, params, mode):
         for atom_id in atoms:
             if mode == 'on':
                 charge, sigma, eps = params[atom_id]
@@ -248,15 +293,16 @@ class BaseGCMCSampler(object):
                 error_msg = 'Mode should be either on or off'
                 self.logger.error(error_msg)
                 raise ValueError(error_msg)
-            self.nonbonded_force.setParticleParameters(atom_id, [1., charge, sigma, eps, l])
+            self.nonbonded_force.setParticleParameters(atom_id, [1., charge, sigma, eps, 1.])
         self.nonbonded_force.updateParametersInContext(self.context)
 
     def insert(self, atoms, insert_point=None, random_rotate=True):
         R = random_rotation_matrix()
-        new_positions = deepcopy(self.positions)
+        old_positions = deepcopy(self.positions)
+#        new_positions = deepcopy(self.positions)
         for i, index in enumerate(atoms):
             #  Translate coordinates to an origin defined by the oxygen atom, and normalise
-            atom_position = self.positions[index] - self.positions[atoms[0]]
+            atom_position = old_positions[index] - old_positions[atoms[0]]
             # Rotate about the oxygen position
             if i != 0:
                 vec_length = np.linalg.norm(atom_position)
@@ -266,13 +312,17 @@ class BaseGCMCSampler(object):
                     atom_position = vec_length * np.dot(R, atom_position)
             if insert_point is not None:
                 # Translate to insertion point
-                new_positions[index] = atom_position + insert_point
+                #new_positions[index] = atom_position + insert_point
+                self.positions[index] = atom_position + insert_point
             else:
-                new_positions[index] = atom_position
-        return new_positions
+                self.positions[index] = atom_position
+        return old_positions
     
     def delete(self, atoms):
+        old_positions = deepcopy(self.positions)
         self.adjust_specific_ligand(atoms,self.lig_params,mode='off')
+        return old_positions
+
 
     def move(self):
         if np.random.rand() < self.insert_prob:
@@ -284,9 +334,9 @@ class BaseGCMCSampler(object):
             #    self.nonbonded_force.setParticleParameters(atom_id, charge, sigma, eps)
             #insert_point = (np.random.rand(3) * self.simulation_box)
             insert_point = (np.random.rand(3) * (self.max_dimension - self.min_dimension).value_in_unit(unit.nanometer)) * unit.nanometer + self.min_dimension
-            new_positions = self.insert(atoms, insert_point)
-            self.context.setPositions(new_positions)
+            old_positions = self.insert(atoms, insert_point)
             self.adjust_specific_ligand(atoms,self.lig_params,mode='on')
+            self.context.setPositions(self.positions)
             self.nonbonded_force.updateParametersInContext(self.context)
             #print(self.context.getState(getEnergy=True).getPotentialEnergy())
             #self.context.setVelocitiesToTemperature(self.temperature)
@@ -304,10 +354,9 @@ class BaseGCMCSampler(object):
                 log_acc_prob = self.B - (new_energy - self.energy)/self.kT - self.N - 1
                 if log_acc_prob < np.log(np.random.rand()) or np.isnan(log_acc_prob):
                     self.adjust_specific_ligand(atoms,self.lig_params,mode='off')
-                    self.context.setPositions(self.positions)
+                    self.context.setPositions(old_positions)
                 else:
                     # Update some variables if move is accepted
-                    self.positions = deepcopy(new_positions)
                     self.N += 1
                     self.n_accepted += 1
                     self.real_lig_res_ids.append(str(res_id))
@@ -318,7 +367,7 @@ class BaseGCMCSampler(object):
                     self.reporter.report(self.simulation,self.context.getState(getPositions=True,getEnergy=True))
             except:
                 print('Explosion')
-                self.context.setPositions(self.positions)
+                self.context.setPositions(old_positions)
                 self.adjust_specific_ligand(atoms,self.lig_params,mode='off')
                 pass
             
@@ -326,25 +375,33 @@ class BaseGCMCSampler(object):
             # Delete
             res_id = np.random.choice(self.real_lig_res_ids)
             atoms = self.lig_atom_ids[res_id]
-            self.delete(atoms)
+            old_positions = self.delete(atoms)
             #self.simulation.step(10)
-            self.simulation.minimizeEnergy(maxIterations=10)
-            new_energy = self.context.getState(getEnergy=True).getPotentialEnergy()
-            #acc_prob = self.N * math.exp(-self.B) * math.exp(-(new_energy - self.energy) / self.kT)
-            log_acc_prob = - self.B - (new_energy - self.energy)/self.kT + self.N 
-            if log_acc_prob < np.log(np.random.rand()) or np.isnan(log_acc_prob):
+            try:
+                self.simulation.minimizeEnergy()
+                new_energy = self.context.getState(getEnergy=True).getPotentialEnergy()
+                #acc_prob = self.N * math.exp(-self.B) * math.exp(-(new_energy - self.energy) / self.kT)
+                log_acc_prob = - self.B - (new_energy - self.energy)/self.kT + self.N
+                if log_acc_prob < np.log(np.random.rand()) or np.isnan(log_acc_prob):
+                    print('kept: ', res_id, -(new_energy - self.energy)/self.kT)
+                    self.context.setPositions(old_positions)
+                    self.adjust_specific_ligand(atoms,self.lig_params,mode='on')
+                else:
+                    # Update some variables if move is accepted
+                    # self.positions = deepcopy(new_positions)
+                    print('deleted: ', res_id, -(new_energy - self.energy)/self.kT)
+                    self.N -= 1
+                    self.n_accepted += 1
+                    self.ghost_lig_res_ids.append(str(res_id))
+                    self.real_lig_res_ids.remove(res_id)
+                    # Update energy
+                    self.energy = new_energy
+                    self.reporter.report(self.simulation,self.context.getState(getPositions=True,getEnergy=True))
+            except:
+                print('Explosion')
+                self.context.setPositions(old_positions)
                 self.adjust_specific_ligand(atoms,self.lig_params,mode='on')
-                self.context.setPositions(self.positions)
-            else:
-                # Update some variables if move is accepted
-                # self.positions = deepcopy(new_positions)
-                self.N -= 1
-                self.n_accepted += 1
-                self.ghost_lig_res_ids.append(str(res_id))
-                self.real_lig_res_ids.remove(res_id)
-                # Update energy
-                self.energy = new_energy
-                self.reporter.report(self.simulation,self.context.getState(getPositions=True,getEnergy=True))
+                pass
 
     def raiseError(self, error_msg):
         """
@@ -362,60 +419,6 @@ class BaseGCMCSampler(object):
 
         return None
 
-class VoronoiGCMCSampler(BaseGCMCSampler):
-    def __init__(self,):
-        BaseGCMCSampler.__init__(self,)
-        self.insert_points_list = voronoi_vertices
-
-    def move(self):
-        if np.random.rand() < self.insert_prob:
-            # Insert
-            res_id = np.random.choice(self.ghost_lig_res_ids)
-            atoms = self.lig_atom_ids[res_id]
-            insert_point =  np.random.choice(self.insert_points_list)* unit.nanometer
-            new_positions = self.insert(atoms, insert_point)
-            self.context.setPositions(new_positions)
-            self.adjust_specific_ligand(atoms,self.lig_params,mode='on')
-            self.nonbonded_force.updateParametersInContext(self.context)
-            try:
-                self.simulation.minimizeEnergy()
-                new_energy = self.context.getState(getEnergy=True).getPotentialEnergy()
-                log_acc_prob = self.B - (new_energy - self.energy)/self.kT - self.N - 1
-                if log_acc_prob < np.log(np.random.rand()) or np.isnan(log_acc_prob):
-                    self.adjust_specific_ligand(atoms,self.lig_params,mode='off')
-                    self.context.setPositions(self.positions)
-                else:
-                    self.positions = deepcopy(new_positions)
-                    self.N += 1
-                    self.n_accepted += 1
-                    self.real_lig_res_ids.append(str(res_id))
-                    self.ghost_lig_res_ids.remove(res_id)
-                    self.energy = new_energy
-                    self.reporter.report(self.simulation,self.context.getState(getPositions=True,getEnergy=True))
-            except:
-                print('Explosion')
-                self.context.setPositions(self.positions)
-                self.adjust_specific_ligand(atoms,self.lig_params,mode='off')
-                pass
-            
-        else:
-            # Delete
-            res_id = np.random.choice(self.real_lig_res_ids)
-            atoms = self.lig_atom_ids[res_id]
-            self.delete(atoms)
-            self.simulation.minimizeEnergy(maxIterations=10)
-            new_energy = self.context.getState(getEnergy=True).getPotentialEnergy()
-            log_acc_prob = - self.B - (new_energy - self.energy)/self.kT + self.N 
-            if log_acc_prob < np.log(np.random.rand()) or np.isnan(log_acc_prob):
-                self.adjust_specific_ligand(atoms,self.lig_params,mode='on')
-                self.context.setPositions(self.positions)
-            else:
-                self.N -= 1
-                self.n_accepted += 1
-                self.ghost_lig_res_ids.append(str(res_id))
-                self.real_lig_res_ids.remove(res_id)
-                self.energy = new_energy
-                self.reporter.report(self.simulation,self.context.getState(getPositions=True,getEnergy=True))
 
 class BaseGCNCMCSampler(BaseGCMCSampler):
     def __init__(self, system, topology, temperature, ligands, integrator, lambdas, adams=None, nPertSteps=1, nPropStepsPerPert=1):
@@ -512,4 +515,85 @@ class BaseGCNCMCSampler(BaseGCMCSampler):
                 # Update energy
                 self.energy = new_energy
                 self.reporter.report(self.simulation,self.context.getState(getPositions=True,getEnergy=True))
-    
+
+"""
+def move(self):
+        if np.random.rand() < self.insert_prob:
+            # Insert
+            res_id = np.random.choice(self.ghost_lig_res_ids)
+            atoms = self.lig_atom_ids[res_id]
+            #for atom_id in atoms:
+            #    charge, sigma, eps = self.lig_params[atom_id]
+            #    self.nonbonded_force.setParticleParameters(atom_id, charge, sigma, eps)
+            #insert_point = (np.random.rand(3) * self.simulation_box)
+            insert_point = (np.random.rand(3) * (self.max_dimension - self.min_dimension).value_in_unit(unit.nanometer)) * unit.nanometer + self.min_dimension
+            new_positions = self.insert(atoms, insert_point)
+            self.context.setPositions(new_positions)
+            self.adjust_specific_ligand(atoms,self.lig_params,mode='on')
+            self.nonbonded_force.updateParametersInContext(self.context)
+            #print(self.context.getState(getEnergy=True).getPotentialEnergy())
+            #self.context.setVelocitiesToTemperature(self.temperature)
+            try:
+                #self.simulation.step(1000)
+                self.simulation.minimizeEnergy()
+                #self.simulation.minimizeEnergy(maxIterations=100)
+                new_energy = self.context.getState(getEnergy=True).getPotentialEnergy()
+                #new_velocities = self.context.getState(getVelocities=True).getVelocities()
+                #self.reporter.report(self.simulation,self.context.getState(getPositions=True,getEnergy=True))
+                #try:
+                #    acc_prob = math.exp(self.B -(new_energy - self.energy) / self.kT) / (self.N + 1)
+                #except OverflowError:
+                #    acc_prob = float('inf')
+                log_acc_prob = self.B - (new_energy - self.energy)/self.kT - self.N - 1
+                if log_acc_prob < np.log(np.random.rand()) or np.isnan(log_acc_prob):
+                    self.adjust_specific_ligand(atoms,self.lig_params,mode='off')
+                    self.context.setPositions(self.positions)
+                else:
+                    # Update some variables if move is accepted
+                    self.positions = deepcopy(new_positions)
+                    self.N += 1
+                    self.n_accepted += 1
+                    self.real_lig_res_ids.append(str(res_id))
+                    self.ghost_lig_res_ids.remove(res_id)
+                    # Update energy
+                    self.energy = new_energy
+                    #self.velocities = new_velocities
+                    self.reporter.report(self.simulation,self.context.getState(getPositions=True,getEnergy=True))
+            except:
+                print('Explosion')
+                self.context.setPositions(self.positions)
+                self.adjust_specific_ligand(atoms,self.lig_params,mode='off')
+                pass
+            
+        else:
+            # Delete
+            res_id = np.random.choice(self.real_lig_res_ids)
+            atoms = self.lig_atom_ids[res_id]
+            self.delete(atoms)
+            #self.simulation.step(10)
+            try:
+                self.simulation.minimizeEnergy()
+                new_energy = self.context.getState(getEnergy=True).getPotentialEnergy()
+                #acc_prob = self.N * math.exp(-self.B) * math.exp(-(new_energy - self.energy) / self.kT)
+                log_acc_prob = - self.B - (new_energy - self.energy)/self.kT + self.N
+                if log_acc_prob < np.log(np.random.rand()) or np.isnan(log_acc_prob):
+                    print('kept: ', res_id, -(new_energy - self.energy)/self.kT)
+                    self.context.setPositions(self.positions)
+                    self.adjust_specific_ligand(atoms,self.lig_params,mode='on')
+                else:
+                    # Update some variables if move is accepted
+                    # self.positions = deepcopy(new_positions)
+                    print('deleted: ', res_id, -(new_energy - self.energy)/self.kT)
+                    self.N -= 1
+                    self.n_accepted += 1
+                    self.ghost_lig_res_ids.append(str(res_id))
+                    self.real_lig_res_ids.remove(res_id)
+                    # Update energy
+                    self.energy = new_energy
+                    self.reporter.report(self.simulation,self.context.getState(getPositions=True,getEnergy=True))
+            except:
+                print('Explosion')
+                self.context.setPositions(self.positions)
+                self.adjust_specific_ligand(atoms,self.lig_params,mode='on')
+                pass
+"""

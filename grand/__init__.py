@@ -8,5 +8,5 @@ Marley L. Samways
 
 __version__ = "1.1.0"
 
-from grand import samplers, utils, potential, tests, lig_samplers
+from grand import lig_samplers_old, samplers, utils, potential, tests
 
