@@ -28,7 +28,7 @@ class BaseGCMCSampler(object):
     Base class for carrying out GCMC moves in OpenMM.
     All other Sampler objects are derived from this
     """
-    def __init__(self, system, topology, temperature, ligands=[], log='gcmc.log', overwrite=False,
+    def __init__(self, forcefield, topology, temperature, ligands=[], log='gcmc.log', overwrite=False,
                  B=-6., insert_prob=0.5, positions=None,integrator=None,reporter=None, ghosts=None,
                  water_resn='HOH'):
         # Create logging object
@@ -45,8 +45,9 @@ class BaseGCMCSampler(object):
         self.logger.addHandler(file_handler)
 
         # Set OpenMM system variables
-        self.system = system
+        self.forcefield = forcefield
         self.topology = topology
+        self.system = self.forcefield.createSystem(self.topology)
         self.positions = positions
         i = 1
         for force in self.system.getForces():
@@ -61,8 +62,8 @@ class BaseGCMCSampler(object):
         self.logger.info(f'kT = {self.kT.in_units_of(unit.kilocalorie_per_mole)}')
 
         # Find NonbondedForce - needs to be updated to switch waters on/off
-        for f in range(system.getNumForces()):
-            force = system.getForce(f)
+        for f in range(self.system.getNumForces()):
+            force = self.system.getForce(f)
             if force.__class__.__name__ == "NonbondedForce":
                 self.nonbonded_force = force
                 self.nonbonded_force_index = f
@@ -363,8 +364,12 @@ class BaseGCMCSampler(object):
         return None
 
 class VoronoiGCMCSampler(BaseGCMCSampler):
-    def __init__(self,):
-        BaseGCMCSampler.__init__(self,)
+    def __init__(self,system, topology, temperature, ligands=[], voronoi_vertices=[], log='gcmc.log', overwrite=False,
+                 B=-6., insert_prob=0.5, positions=None,integrator=None,reporter=None, ghosts=None,
+                 water_resn='HOH'):
+        BaseGCMCSampler.__init__(self, system, topology, temperature, ligands=ligands, log=log, overwrite=overwrite,
+                 B=B, insert_prob=insert_prob, positions=positions,integrator=integrator,reporter=reporter, ghosts=ghosts,
+                 water_resn=water_resn)
         self.insert_points_list = voronoi_vertices
 
     def move(self):
@@ -372,7 +377,7 @@ class VoronoiGCMCSampler(BaseGCMCSampler):
             # Insert
             res_id = np.random.choice(self.ghost_lig_res_ids)
             atoms = self.lig_atom_ids[res_id]
-            insert_point =  np.random.choice(self.insert_points_list)* unit.nanometer
+            insert_point =  self.insert_points_list[np.random.choice(len(self.insert_points_list))]* unit.nanometer
             new_positions = self.insert(atoms, insert_point)
             self.context.setPositions(new_positions)
             self.adjust_specific_ligand(atoms,self.lig_params,mode='on')
@@ -417,10 +422,16 @@ class VoronoiGCMCSampler(BaseGCMCSampler):
                 self.energy = new_energy
                 self.reporter.report(self.simulation,self.context.getState(getPositions=True,getEnergy=True))
 
-class BaseGCNCMCSampler(BaseGCMCSampler):
-    def __init__(self, system, topology, temperature, ligands, integrator, lambdas, adams=None, nPertSteps=1, nPropStepsPerPert=1):
-        BaseGCMCSampler.__init__(self, system, topology, temperature, ligands)
-        self.velocities = None
+class GCNCMCSampler(BaseGCMCSampler):
+    def __init__(self,system, topology, temperature, ligands=[], n_pert_steps=1, n_prop_steps_per_pert=1, log='gcmc.log', overwrite=False,
+                 B=-6., insert_prob=0.5, positions=None,integrator=None,reporter=None, ghosts=None,
+                 water_resn='HOH'):
+        BaseGCMCSampler.__init__(self, system, topology, temperature, ligands=ligands, log=log, overwrite=overwrite,
+                 B=B, insert_prob=insert_prob, positions=positions,integrator=integrator,reporter=reporter, ghosts=ghosts,
+                 water_resn=water_resn)
+        self.n_pert_steps = n_pert_steps
+        self.n_prop_steps_per_pert = n_prop_steps_per_pert
+
         if lambdas is not None:
             assert np.isclose(lambdas[0], 0.0) and np.isclose(lambdas[-1], 1.0), "Lambda series must start at 0 and end at 1"
             self.lambdas = lambdas
@@ -512,4 +523,182 @@ class BaseGCNCMCSampler(BaseGCMCSampler):
                 # Update energy
                 self.energy = new_energy
                 self.reporter.report(self.simulation,self.context.getState(getPositions=True,getEnergy=True))
-    
+            
+
+
+
+# TODO: remove ghosts from the system and run MD
+# Find reason why MD blows up
+class MDSimulator():
+    def __init__(self, sampler, reporter=None, integrator=None, explicit=True, ligand_resn='UNK', water_resn='HOH', save_pdb=None):
+        # Delete ghost fragments from the system
+        modeller = openmm.app.Modeller(sampler.topology, sampler.positions)
+        toDelete = [r for r in sampler.topology.residues() if r.index in sampler.ghost_lig_res_ids]
+        modeller.delete(toDelete)
+        print('Adding solvent')
+        # Add water if simulation is in explicit solvent
+        if explicit:
+            modeller.addSolvent(forcefield=sampler.forcefield,padding=1*openmm.unit.nanometer)
+        # Store topology and positions
+        self.topology = modeller.topology
+        self.positions = modeller.positions
+        if save_pdb:
+            openmm.app.PDBFile.writeFile(self.topology, self.positions, save_pdb)
+
+
+        print('Setting parameters')
+        # Store ligand/water/protein related variables
+        self.lig_res_ids = []
+        self.lig_atom_ids = defaultdict(list)
+        self.wat_atom_ids = defaultdict(list)
+        self.prot_positions = []
+        for resid, residue in enumerate(self.topology.residues()):
+            if residue.name == ligand_resn:
+                self.lig_res_ids.append(resid)
+                for atom in residue.atoms():
+                    self.lig_atom_ids[resid].append(atom.index)
+            elif residue.name == water_resn:
+                for atom in residue.atoms():
+                    self.wat_atom_ids[resid].append(atom.index)
+            else:
+                for atom in residue.atoms():
+                    self.prot_positions.append(self.positions[atom.index])
+        self.prot_positions = unit.Quantity(self.prot_positions)
+        
+        # Setup OpenMM
+        self.system = sampler.forcefield.createSystem(self.topology)
+        self.simulation = openmm.app.Simulation(
+            self.topology,
+            self.system,    
+            integrator,
+            openmm.Platform.getPlatformByName("CUDA"),  # faster if running in vacuum
+        )
+        if reporter:
+            self.reporter = reporter
+            self.simulation.reporters.append(self.reporter)
+        
+        # Find NonbondedForce - needs to be updated to switch waters on/off
+        for f in range(self.system.getNumForces()):
+            force = self.system.getForce(f)
+            if force.__class__.__name__ == "NonbondedForce":
+                self.nonbonded_force = force
+                self.nonbonded_force_index = f
+
+        # Customize force so that ligand-ligand interaction can be ignored
+        self.customize_forces()
+       
+        self.context = self.simulation.context
+        self.context.setPositions(self.positions)
+
+
+
+        # Compute energy and forces
+        for f in range(self.system.getNumForces()):
+            print(self.system.getForce(f).__class__.__name__)
+            force_group = self.system.getForce(f).getForceGroup()
+            print(force_group)
+            print(self.context.getState(getEnergy=True,groups={force_group}).getPotentialEnergy())
+        self.energy = self.context.getState(getEnergy=True).getPotentialEnergy()
+        print(f'Initial Energy: {self.energy}')
+        
+        print('Minimizing')
+        # Minimize the system
+        self.simulation.minimizeEnergy()
+
+    def customize_forces(self):
+        """
+        Create a CustomNonbondedForce to handle ligand-ligand interactions
+        For custom steric (LJ potential), soft core potential will be used
+        For custom coulomb force, cufoff periodic with reaction field will be used
+        These custom forces are applied to turn off ligand-ligand interactions
+        """
+        #if self.nonbonded_force.getNonbondedMethod() != openmm.NonbondedForce.CutoffPeriodic:
+        #    self.raiseError("Currently only supporting CutoffPeriodic for long range electrostatics")
+        #else:
+        eps_solvent = self.nonbonded_force.getReactionFieldDielectric()
+        cutoff = self.nonbonded_force.getCutoffDistance()
+        krf = (1/ (cutoff**3)) * (eps_solvent - 1) / (2*eps_solvent + 1)
+        crf = (1/ cutoff) * (3* eps_solvent) / (2*eps_solvent + 1)
+
+        energy_expression  = "select(condition, 0, 1)*all;"
+        energy_expression += "condition = soluteFlag1*soluteFlag2;" #solute must have flag int(1)
+        energy_expression += "all=(lambda^soft_a) * 4 * epsilon * x * (x-1.0) + ONE_4PI_EPS0*chargeprod*(1/r + krf*r*r - crf);"
+        energy_expression += "x = (sigma/reff)^6;"  # Define x as sigma/r(effective)
+        energy_expression += "reff = sigma*((soft_alpha*(1.0-lambda)^soft_b + (r/sigma)^soft_c))^(1/soft_c);" # Calculate effective distance
+        energy_expression += "lambda = lambda1*lambda2;"
+        energy_expression += "epsilon = epsilon1*epsilon2;"
+        energy_expression += "sigma = 0.5*(sigma1+sigma2);"
+        energy_expression += "ONE_4PI_EPS0 = {:f};".format(ONE_4PI_EPS0)  # already in OpenMM units
+        energy_expression += "chargeprod = charge1*charge2;"
+        energy_expression += "krf = {:f};".format(krf.value_in_unit(unit.nanometer**-3))
+        energy_expression += "crf = {:f};".format(crf.value_in_unit(unit.nanometer**-1))
+        custom_nonbonded_force = openmm.CustomNonbondedForce(energy_expression)
+        custom_nonbonded_force.addPerParticleParameter('soluteFlag')
+        custom_nonbonded_force.addPerParticleParameter('charge')
+        custom_nonbonded_force.addPerParticleParameter('sigma')
+        custom_nonbonded_force.addPerParticleParameter('epsilon')
+        custom_nonbonded_force.addPerParticleParameter('lambda')
+        # Configure force
+        custom_nonbonded_force.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
+        custom_nonbonded_force.setUseSwitchingFunction(self.nonbonded_force.getUseSwitchingFunction())
+        custom_nonbonded_force.setCutoffDistance(self.nonbonded_force.getCutoffDistance())
+        custom_nonbonded_force.setSwitchingDistance(self.nonbonded_force.getSwitchingDistance())
+        self.nonbonded_force.setUseDispersionCorrection(False)
+        custom_nonbonded_force.setUseLongRangeCorrection(self.nonbonded_force.getUseDispersionCorrection())
+        # Set softcore parameters
+        custom_nonbonded_force.addGlobalParameter('soft_alpha', 0.5)
+        custom_nonbonded_force.addGlobalParameter('soft_a', 1)
+        custom_nonbonded_force.addGlobalParameter('soft_b', 1)
+        custom_nonbonded_force.addGlobalParameter('soft_c', 6)
+
+        lig_atom_ids = []
+        for resid, residue in enumerate(self.topology.residues()):
+            if resid in self.lig_res_ids:
+                for atom in residue.atoms():
+                    lig_atom_ids.append(atom.index)
+
+        # Copy all steric interactions into the custom force, and remove them from the original force
+        for atom_idx in range(self.nonbonded_force.getNumParticles()):
+            # Get atom parameters
+            [charge, sigma, epsilon] = self.nonbonded_force.getParticleParameters(atom_idx)
+            # Make sure that sigma is not equal to zero
+            if np.isclose(sigma._value, 0.0):
+                sigma = 1.0 * unit.angstrom
+            # Add particle to the custom force (with lambda=1 for now)
+            if atom_idx in lig_atom_ids:
+                custom_nonbonded_force.addParticle([1.0, charge, sigma, epsilon, 1.0])
+            else:
+                custom_nonbonded_force.addParticle([0.0, charge, sigma, epsilon, 1.0])
+
+        # Copy over all exceptions into the new force as custom bonded forces
+        # Exceptions between non-ligand atoms will be excluded here, and handled by the NonbondedForce
+        # If exceptions (other than ignored interactions) are found involving ligand atoms, we have a problem
+        energy_expression = "4*epsilon*((sigma/r)^12 - (sigma/r)^6) + ONE_4PI_EPS0*chargeprod*(1/r);"
+        energy_expression += "ONE_4PI_EPS0 = {:f};".format(ONE_4PI_EPS0)
+        custom_bond_force = openmm.CustomBondForce(energy_expression)
+        custom_bond_force.addPerBondParameter('chargeprod')
+        custom_bond_force.addPerBondParameter('sigma')
+        custom_bond_force.addPerBondParameter('epsilon')
+        
+        for exception_idx in range(self.nonbonded_force.getNumExceptions()):
+            [i, j, chargeprod, sigma, epsilon] = self.nonbonded_force.getExceptionParameters(exception_idx)
+            # Add this to the list of exclusions
+            custom_nonbonded_force.addExclusion(i, j)
+            if i in lig_atom_ids and j in lig_atom_ids:
+                pass
+            else:
+                custom_bond_force.addBond(i, j, [chargeprod, sigma, epsilon])
+
+        # Update system
+        new_index = self.system.addForce(custom_nonbonded_force)
+        self.system.addForce(custom_bond_force)
+        self.system.removeForce(self.nonbonded_force_index)
+        self.nonbonded_force = custom_nonbonded_force
+        self.nonbonded_force_index = new_index
+
+        return None
+
+    def run_npt(self,n,P=1,T=298):
+        self.system.addForce(openmm.MonteCarloBarostat(P*openmm.unit.bar, T*openmm.unit.kelvin))
+        self.context.reinitialize(preserveState=True)
+        self.simulation.step(n)
