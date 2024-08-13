@@ -122,8 +122,7 @@ class BaseNCMCSampler(object):
             #insert_point = openmm.Vec3(0.4961, 1.4597, 2.3242) * openmm.unit.nanometer
             new_positions = self.insert_fragment(self.frag_atoms, insert_point)
             self.context.setPositions(new_positions)
-            self.reporter.report(self.simulation,self.context.getState(getPositions=True,getEnergy=True))
-            self.compound_integrator.setCurrentIntegrator(1)
+            self.compound_integrator.setCurrentIntegrator(0)
             # Minimize energy
             #self.simulation.minimizeEnergy()
 
