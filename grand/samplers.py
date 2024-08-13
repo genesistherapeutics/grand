@@ -402,7 +402,7 @@ class BaseGrandCanonicalMonteCarloSampler(object):
             Value to set lambda to for this particle
         """
         # Get lambda values
-        lambda_vdw, lambda_ele = get_lambda_values(new_lambda)
+        lambda_vdw, lambda_ele =  q(new_lambda)
 
         # Loop over parameters
         for i, atom_idx in enumerate(atoms):
