@@ -118,19 +118,20 @@ class BaseNCMCSampler(object):
     def ncmc_move(self, nsteps):
         for step in tqdm.tqdm(range(nsteps)):
             protocol_work = 0
-            #insert_point = self.insert_points_list[np.random.choice(len(self.insert_points_list))] * unit.nanometer
-            insert_point = openmm.Vec3(0.4961, 1.4597, 2.3242) * openmm.unit.nanometer
+            insert_point = self.insert_points_list[np.random.choice(len(self.insert_points_list))] * unit.nanometer
+            #insert_point = openmm.Vec3(0.4961, 1.4597, 2.3242) * openmm.unit.nanometer
             new_positions = self.insert_fragment(self.frag_atoms, insert_point)
             self.context.setPositions(new_positions)
             self.reporter.report(self.simulation,self.context.getState(getPositions=True,getEnergy=True))
             self.compound_integrator.setCurrentIntegrator(1)
             # Minimize energy
             #self.simulation.minimizeEnergy()
-            
+
             # NC steps without MD
-            #self.simulation.step(self.nsteps_neq)
+            self.simulation.step(self.nsteps_neq)
             
             # NC steps with MD
+            """
             for neq_step in range(self.nsteps_neq):
                 # print(self.nc_integrator.getGlobalVariableByName('lambda'))
                 self.compound_integrator.setCurrentIntegrator(0)
@@ -140,6 +141,7 @@ class BaseNCMCSampler(object):
                 self.compound_integrator.step(self.nsteps_eq)
                 # Run Minimization
                 #self.simulation.minimizeEnergy(maxIterations=100)
+            """
             log_acc_prob = - (self.nc_integrator.protocol_work)/self.kT
             # Reject
             if log_acc_prob < np.log(np.random.rand()) or np.isnan(log_acc_prob):
