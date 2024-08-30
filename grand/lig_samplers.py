@@ -91,6 +91,9 @@ class BaseMCSampler(object):
         return None
     
 class BaseGCMCSampler(BaseMCSampler):
+    """
+    Base GCMC Sampler. Most of the structure will be similar to "grand" GCMC.
+    """
     def __init__(self, forcefield, topology, temperature, ligands=[], custom_force=False, log='gcmc.log', overwrite=False,
                  B=-6., insert_prob=0.5, positions=None,integrator=None,reporters=[], ghosts=None, insert_points_list=[],
                  water_resn='HOH'):
@@ -378,6 +381,10 @@ class BaseGCMCSampler(BaseMCSampler):
                 self.reporter.report(self.simulation,self.context.getState(getPositions=True,getEnergy=True))
 
 class BaseNCMCSampler(BaseMCSampler):
+    """
+    NCMC sampler. Modified GCMC sampler and replaced the integrators with those from openmmtools for smoother alchemical transition.
+    BLUES implementation of NCMC seems to be more detailed. Would recommend adopting BLUES-like sampler than grand-like sampler.
+    """
     def __init__(self, reference_system, topology, positions, alchemical_atoms, reporters=[], overwrite=False,
                  nsteps_neq=100, nsteps_eq=1000, temperature=298*unit.kelvin, insert_points_list=[], frag_atoms=[]):
         # Set up alchemy
@@ -535,6 +542,10 @@ class BaseNCMCSampler(BaseMCSampler):
         return np.mean(self.fpt_list), np.std(self.fpt_list)
 
 class GCNCMCSampler(BaseGCMCSampler):
+    """
+    GCNCMC Sampler. Basaed on GCMC and grand. Obvious update will be changing to openmmtools, but ligands changing state from ghost to real (or vice versa)
+    makes it slightly trickier to use openmm alchemical nc integrator.
+    """
     def __init__(self, forcefield, topology, temperature, ligands=[], lambdas=None, n_pert_steps=1, n_prop_steps_per_pert=1, log='gcmc.log', overwrite=False,
                  B=-6., insert_prob=0.5, positions=None,integrator=None,reporters=[], ghosts=None, custom_force=False,
                  water_resn='HOH',time_step=2*openmm.unit.femtoseconds):

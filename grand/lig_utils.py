@@ -136,6 +136,9 @@ def random_rotation_matrix():
     return rot_matrix
 
 def rotate_molecule(positions, atom_indices, insert_point=None):
+    """
+    Rotate and translate the given molecule.
+    """
     R = random_rotation_matrix()
     new_positions = deepcopy(positions)
     #positions = positions.value_in_unit(unit.nanometer)
