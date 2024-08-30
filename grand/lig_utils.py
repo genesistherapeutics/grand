@@ -9,6 +9,7 @@ from openmmtools.constants import ONE_4PI_EPS0
 from copy import deepcopy
 from scipy.cluster import hierarchy
 import warnings
+import Bio.PDB
 
 import tqdm
 import multiprocessing
@@ -56,21 +57,30 @@ def add_ghosts(prot_top, prot_pos, lig_top, lig_pos, n=10, output='gcmc-ghosts.p
     for chain in modeller.topology.chains():
         chain_ids.append(chain.id)
 
+    atom_ids = []
+    for resid, residue in enumerate(lig_top.residues()):
+        for atom in residue.atoms():
+            atom_ids.append(atom.index)
+
+    ca_coords = []
+    
+    for atom in prot_top.atoms():
+        if atom.name == 'CA':
+            ca_coords.append(prot_pos[atom.index])
     # Read in simulation box size
     box_vectors = prot_top.getPeriodicBoxVectors()
-    box_size = np.array([box_vectors[0][0]._value,
-                         box_vectors[1][1]._value,
-                         box_vectors[2][2]._value]) * unit.nanometer
+    #box_size = np.array([box_vectors[0][0]._value,
+    #                     box_vectors[1][1]._value,
+    #                     box_vectors[2][2]._value]) * unit.nanometer
 
     # Add multiple copies of the same water, then write out a pdb (for visualisation)
-    ghosts = []        
-    new_centres = np.array([2.7880, 0.6749, 0.3701]) * unit.nanometer #np.zeros((n,3)) * unit.nanometer  #+ np.random.rand(n,3) * unit.nanometer #* 10 + box_size
+    ghosts = []
+    offsets = np.random.random((n,3))
+    offsets /= np.linalg.norm(offsets, axis=1,keepdims=True)
+    offsets *= np.random.random((n,1)) * np.sqrt(0.5) * unit.nanometer
     for idx in tqdm.tqdm(range(n)):
-        # Need to translate the water to a random point in the simulation box]
-        new_positions = deepcopy(lig_pos)
-        for i in range(len(lig_pos)):
-            new_positions[i] = lig_pos[i] + new_centres[idx] - lig_pos[0]
-
+        new_center = ca_coords[np.random.choice(len(ca_coords))] + offsets[idx]
+        new_positions = rotate_molecule(lig_pos,atom_ids,insert_point=new_center)
         # Add the water to the model and include the resid in a list
         modeller.add(addTopology=lig_top, addPositions=new_positions)
         ghosts.append(modeller.topology._numResidues - 1)
@@ -128,6 +138,7 @@ def random_rotation_matrix():
 def rotate_molecule(positions, atom_indices, insert_point=None):
     R = random_rotation_matrix()
     new_positions = deepcopy(positions)
+    #positions = positions.value_in_unit(unit.nanometer)
     for i, index in enumerate(atom_indices):
         #  Translate coordinates to an origin defined by the oxygen atom, and normalise
         atom_position = positions[index] - positions[atom_indices[0]]
@@ -136,50 +147,10 @@ def rotate_molecule(positions, atom_indices, insert_point=None):
             vec_length = np.linalg.norm(atom_position)
             atom_position = atom_position / vec_length
             # Rotate coordinates & restore length
-            atom_position = vec_length * np.dot(R, atom_position) #* unit.nanometer
+            atom_position = vec_length * np.dot(R, atom_position) * atom_position.unit
         if insert_point is not None:
             # Translate to insertion point
             new_positions[index] = atom_position + insert_point
         else:
             new_positions[index] = atom_position
     return new_positions
-
-#TODO: Double-check custom nb is correct
-#TODO: add appropriate global parameters
-def custom_nonbonded_force(alpha_ewald, cutoff_distance):
-    #CustomNonbondedForce with LJ and Coulomb terms
-    energy_expression  = "select(condition,0,1)*all;"
-    energy_expression += "condition = soluteFlag1*soluteFlag2;" #solute must have flag int(1)
-    energy_expression += "all=4*epsilon*((sigma/r)^12 - (sigma/r)^6) + ONE_4PI_EPS0*chargeprod*erfc(alpha_ewald*r)/r;"
-    energy_expression += "epsilon = epsilon1*epsilon2;"
-    energy_expression += "sigma = 0.5*(sigma1+sigma2);"
-    energy_expression += "ONE_4PI_EPS0 = {:f};".format(ONE_4PI_EPS0)  # already in OpenMM units
-    energy_expression += "chargeprod = charge1*charge2;"
-    energy_expression += "alpha_ewald = {:f};".format(alpha_ewald.value_in_unit_system(unit.md_unit_system))
-    custom_nonbonded_force = openmm.CustomNonbondedForce(energy_expression)
-    custom_nonbonded_force.addPerParticleParameter('soluteFlag')
-    custom_nonbonded_force.addPerParticleParameter('charge')
-    custom_nonbonded_force.addPerParticleParameter('sigma')
-    custom_nonbonded_force.addPerParticleParameter('epsilon')
-    # Configure force
-    custom_nonbonded_force.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
-    custom_nonbonded_force.setCutoffDistance(1*unit.nanometer)
-    
-    custom_nonbonded_force.setUseLongRangeCorrection(False)
-    custom_nonbonded_force.setUseSwitchingFunction(True)
-    custom_nonbonded_force.setSwitchingDistance(cutoff_distance - 1.0*unit.angstroms)
-
-    #Now must add a bond force to handle exceptions.
-    #(exceptions are altered interactions - but not completely
-    #removed! Also PME is not required now.
-    energy_expression  = "scalingFactor*all;"
-    energy_expression += "all=4*epsilon*((sigma/r)^12 - (sigma/r)^6) + ONE_4PI_EPS0*chargeprod/r;"
-    energy_expression += "ONE_4PI_EPS0 = {:f};".format(ONE_4PI_EPS0)  # already in OpenMM units
-    custom_bond_force = openmm.CustomBondForce(energy_expression)
-    custom_bond_force.addGlobalParameter('scalingFactor', 1)
-    custom_bond_force.addEnergyParameterDerivative('scalingFactor')
-    custom_bond_force.addPerBondParameter('chargeprod')
-    custom_bond_force.addPerBondParameter('sigma')
-    custom_bond_force.addPerBondParameter('epsilon')
-
-    return custom_nonbonded_force, custom_bond_force
